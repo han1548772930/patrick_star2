@@ -126,6 +126,8 @@ slint::slint! {
 
         out property <length> canvas-width: canvas.width;
         out property <length> canvas-height: canvas.height;
+        out property <length> canvas-x: canvas.x;
+        out property <length> canvas-y: canvas.y;
         private property <length> ocr-panel-width: root.ocr-panel-visible
             ? min(360px, max(280px, root.width * 0.3))
             : 0px;
@@ -141,7 +143,6 @@ slint::slint! {
         callback rotate;
         callback copy;
         callback save;
-        callback title-drag;
         callback minimize;
         callback toggle-maximize;
         callback request-close;
@@ -217,14 +218,14 @@ slint::slint! {
                         spacing: 2px;
                         alignment: start;
 
-                    IconButton { icon: @image-url("../../assets/icons/edit.svg"); label: "Select"; active: root.active-tool == 0 && !root.pan-active; clicked => { root.choose-tool(0); } }
-                    IconButton { icon: @image-url("../../assets/icons/square.svg"); label: "Rectangle"; active: root.active-tool == 1 && !root.pan-active; clicked => { root.choose-tool(1); } }
-                    IconButton { icon: @image-url("../../assets/icons/circle.svg"); label: "Ellipse"; active: root.active-tool == 2 && !root.pan-active; clicked => { root.choose-tool(2); } }
-                    IconButton { icon: @image-url("../../assets/icons/move-up-right.svg"); label: "Arrow"; active: root.active-tool == 4 && !root.pan-active; clicked => { root.choose-tool(4); } }
-                    IconButton { icon: @image-url("../../assets/icons/pen.svg"); label: "Pen"; active: root.active-tool == 5 && !root.pan-active; clicked => { root.choose-tool(5); } }
-                    IconButton { icon: @image-url("../../assets/icons/mosaic.svg"); label: "Mosaic"; active: root.active-tool == 6 && !root.pan-active; clicked => { root.choose-tool(6); } }
-                    IconButton { icon: @image-url("../../assets/icons/type.svg"); label: "Text"; active: root.active-tool == 7 && !root.pan-active; clicked => { root.choose-tool(7); } }
-                    IconButton { icon: @image-url("../../assets/icons/emotion.svg"); label: "Emotion"; active: root.active-tool == 3 && !root.pan-active; clicked => { root.choose-tool(3); } }
+                        IconButton { icon: @image-url("../../assets/icons/edit.svg"); label: "Select"; active: root.active-tool == 0 && !root.pan-active; clicked => { root.choose-tool(0); } }
+                        IconButton { icon: @image-url("../../assets/icons/square.svg"); label: "Rectangle"; active: root.active-tool == 1 && !root.pan-active; clicked => { root.choose-tool(1); } }
+                        IconButton { icon: @image-url("../../assets/icons/circle.svg"); label: "Ellipse"; active: root.active-tool == 2 && !root.pan-active; clicked => { root.choose-tool(2); } }
+                        IconButton { icon: @image-url("../../assets/icons/move-up-right.svg"); label: "Arrow"; active: root.active-tool == 4 && !root.pan-active; clicked => { root.choose-tool(4); } }
+                        IconButton { icon: @image-url("../../assets/icons/pen.svg"); label: "Pen"; active: root.active-tool == 5 && !root.pan-active; clicked => { root.choose-tool(5); } }
+                        IconButton { icon: @image-url("../../assets/icons/mosaic.svg"); label: "Mosaic"; active: root.active-tool == 6 && !root.pan-active; clicked => { root.choose-tool(6); } }
+                        IconButton { icon: @image-url("../../assets/icons/type.svg"); label: "Text"; active: root.active-tool == 7 && !root.pan-active; clicked => { root.choose-tool(7); } }
+                        IconButton { icon: @image-url("../../assets/icons/emotion.svg"); label: "Emotion"; active: root.active-tool == 3 && !root.pan-active; clicked => { root.choose-tool(3); } }
 
                         Rectangle { width: 1px; height: 20px; background: #454a52; }
 

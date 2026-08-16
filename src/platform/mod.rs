@@ -12,12 +12,13 @@ mod linux;
 #[allow(unused_imports)]
 pub use api::PlatformWindowActions;
 pub use api::{
-    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, DesktopCapture,
-    DirectoryPicker, GlobalShortcutHost, GlobalShortcutRegistration, ImageClipboard,
-    ImageFileFormat, ImageSaveDialog, ImageSaveTarget, NativeCursorHost, PinnedImageHost,
-    PlatformBackend, PlatformCapabilities, ScrollCaptureEvent, ScrollCaptureIntent,
-    ScrollCaptureSource, ScrollPreview, ScrollPreviewHost, Shortcut, ShortcutKey,
-    ShortcutModifiers, SingleInstanceGuard, SingleInstanceHost, TextClipboard, WindowLocator,
+    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, CaptureOverlayHandoff,
+    CaptureOverlayResult, DesktopCapture, DirectoryPicker, GlobalShortcutHost,
+    GlobalShortcutRegistration, ImageClipboard, ImageFileFormat, ImageSaveDialog, ImageSaveTarget,
+    NativeCursorHost, PinnedImageHost, PlatformBackend, PlatformCapabilities, ScrollCaptureEvent,
+    ScrollCaptureIntent, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost, Shortcut,
+    ShortcutKey, ShortcutModifiers, SingleInstanceGuard, SingleInstanceHost, TextClipboard,
+    WindowLocator,
 };
 
 #[cfg(target_os = "windows")]

@@ -12,8 +12,6 @@ use crate::platform::{ImageClipboard, ImageSaveDialog};
 use crate::rendering::PreviewRenderer;
 use crate::ui::PreviewWindow;
 
-const CANVAS_TOP: f32 = 60.0;
-
 thread_local! {
     static OPEN_PREVIEWS: RefCell<Vec<PreviewWindow>> = const { RefCell::new(Vec::new()) };
 }
@@ -120,7 +118,7 @@ fn install_rendering_notifier(
                     size.width,
                     size.height,
                     scale_factor,
-                    Point::new(0.0, CANVAS_TOP),
+                    Point::new(component.get_canvas_x(), component.get_canvas_y()),
                     &session,
                 );
 
@@ -311,7 +309,6 @@ fn bind_commands(
             let _ = window.hide();
         }
     });
-    window.on_title_drag(|| {});
 }
 
 fn mutate_and_redraw(

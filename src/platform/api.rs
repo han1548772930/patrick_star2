@@ -34,12 +34,29 @@ pub trait DesktopCapture {
     fn capture_virtual_desktop(&self) -> anyhow::Result<DesktopFrame>;
 }
 
+/// Keeps a native capture overlay alive while a follow-up native surface is prepared.
+pub trait CaptureOverlayHandoff {}
+
+pub struct CaptureOverlayResult {
+    pub outcome: CaptureOutcome,
+    pub handoff: Option<Box<dyn CaptureOverlayHandoff>>,
+}
+
+impl CaptureOverlayResult {
+    pub fn complete(outcome: CaptureOutcome) -> Self {
+        Self {
+            outcome,
+            handoff: None,
+        }
+    }
+}
+
 pub trait CaptureOverlay {
     fn run_capture_overlay(
         &self,
         frame: DesktopFrame,
         features: OverlayFeatures,
-    ) -> anyhow::Result<CaptureOutcome>;
+    ) -> anyhow::Result<CaptureOverlayResult>;
 }
 
 /// Keeps this process registered as the sole application instance.

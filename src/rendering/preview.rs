@@ -1,4 +1,5 @@
 use std::ffi::{CStr, c_void};
+use std::mem::ManuallyDrop;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -6,6 +7,7 @@ use femtovg::renderer::OpenGl;
 use femtovg::{Canvas, FontId, ImageFlags, ImageId, ImageInfo, PixelFormat, RenderTarget};
 
 use super::emoji::EmojiRenderer;
+use super::gl_state::OpenGlStateSnapshot;
 use super::opengl::{
     DocumentPass, DocumentTransform, GpuExportTarget, ScenePass, SourcePixelFormat,
     paint_annotations, paint_document,
@@ -14,8 +16,9 @@ use crate::model::preview::{PreviewSession, QuarterTurn, ViewTransform};
 use crate::model::{Point, RectI, RgbaFrame};
 
 pub(crate) struct PreviewRenderer {
-    document: DocumentPass,
-    canvas: Canvas<OpenGl>,
+    state_gl: glow::Context,
+    document: ManuallyDrop<DocumentPass>,
+    canvas: ManuallyDrop<Canvas<OpenGl>>,
     fonts: Vec<FontId>,
     emojis: EmojiRenderer,
     export_target: Option<ExportTarget>,
@@ -31,24 +34,34 @@ impl PreviewRenderer {
         image: &RgbaFrame,
         mut load: impl FnMut(&CStr) -> *const c_void,
     ) -> Result<Self> {
-        let gl = unsafe { glow::Context::from_loader_function_cstr(|name| load(name)) };
-        let document = unsafe {
-            DocumentPass::new(
-                gl,
-                image.width(),
-                image.height(),
-                image.pixels(),
-                SourcePixelFormat::Rgba,
-            )
-        }
-        .context("create preview document pass")?;
-        let vector = unsafe { OpenGl::new_from_function_cstr(load) }
-            .map_err(|error| anyhow!("create preview FemtoVG renderer: {error:?}"))?;
-        let canvas = Canvas::new(vector)
-            .map_err(|error| anyhow!("create preview FemtoVG canvas: {error:?}"))?;
+        let state_gl = unsafe { glow::Context::from_loader_function_cstr(|name| load(name)) };
+        let state = unsafe { OpenGlStateSnapshot::capture(&state_gl) };
+        let created = (|| {
+            let document_gl =
+                unsafe { glow::Context::from_loader_function_cstr(|name| load(name)) };
+            let document = unsafe {
+                DocumentPass::new(
+                    document_gl,
+                    image.width(),
+                    image.height(),
+                    image.pixels(),
+                    SourcePixelFormat::Rgba,
+                )
+            }
+            .context("create preview document pass")?;
+            let mut vector = unsafe { OpenGl::new_from_function_cstr(load) }
+                .map_err(|error| anyhow!("create preview FemtoVG renderer: {error:?}"))?;
+            vector.set_screen_target(state.draw_framebuffer());
+            let canvas = Canvas::new(vector)
+                .map_err(|error| anyhow!("create preview FemtoVG canvas: {error:?}"))?;
+            Ok::<_, anyhow::Error>((document, canvas))
+        })();
+        unsafe { state.restore(&state_gl) };
+        let (document, canvas) = created?;
         Ok(Self {
-            document,
-            canvas,
+            state_gl,
+            document: ManuallyDrop::new(document),
+            canvas: ManuallyDrop::new(canvas),
             fonts: Vec::new(),
             emojis: EmojiRenderer::new(),
             export_target: None,
@@ -56,10 +69,12 @@ impl PreviewRenderer {
     }
 
     pub fn load_font(&mut self, path: &Path) {
+        let state = unsafe { OpenGlStateSnapshot::capture(&self.state_gl) };
         self.emojis.try_load_font(path);
         if let Ok(font) = self.canvas.add_font(path) {
             self.fonts.push(font);
         }
+        unsafe { state.restore(&self.state_gl) };
     }
 
     pub fn render(
@@ -70,12 +85,34 @@ impl PreviewRenderer {
         canvas_origin: Point,
         session: &PreviewSession,
     ) {
+        let state = unsafe { OpenGlStateSnapshot::capture(&self.state_gl) };
+        let target = state.draw_framebuffer();
+        self.render_inner(
+            surface_width,
+            surface_height,
+            scale_factor,
+            canvas_origin,
+            target,
+            session,
+        );
+        unsafe { state.restore(&self.state_gl) };
+    }
+
+    fn render_inner(
+        &mut self,
+        surface_width: u32,
+        surface_height: u32,
+        scale_factor: f32,
+        canvas_origin: Point,
+        target: Option<glow::Framebuffer>,
+        session: &PreviewSession,
+    ) {
         let scale_factor = scale_factor.max(0.01);
         let transform = scene_transform(session.view(), canvas_origin, scale_factor);
         unsafe {
             self.document.draw(
                 ScenePass {
-                    target: None,
+                    target,
                     width: surface_width,
                     height: surface_height,
                     source: session.view().document_bounds(),
@@ -90,6 +127,7 @@ impl PreviewRenderer {
         self.canvas
             .set_size(surface_width, surface_height, scale_factor);
         self.canvas.save();
+        self.canvas.scale(scale_factor, scale_factor);
         self.canvas.translate(canvas_origin.x, canvas_origin.y);
         let canvas_bounds = session.view().canvas_bounds();
         self.canvas.scissor(
@@ -112,6 +150,13 @@ impl PreviewRenderer {
     }
 
     pub fn export(&mut self, session: &PreviewSession) -> Result<RgbaFrame> {
+        let state = unsafe { OpenGlStateSnapshot::capture(&self.state_gl) };
+        let result = self.export_inner(session);
+        unsafe { state.restore(&self.state_gl) };
+        result
+    }
+
+    fn export_inner(&mut self, session: &PreviewSession) -> Result<RgbaFrame> {
         let (width, height) = output_size(session);
         self.ensure_export_target(width, height)?;
         let target = self
@@ -198,7 +243,13 @@ impl PreviewRenderer {
 
 impl Drop for PreviewRenderer {
     fn drop(&mut self) {
+        let state = unsafe { OpenGlStateSnapshot::capture(&self.state_gl) };
         self.delete_export_target();
+        unsafe {
+            ManuallyDrop::drop(&mut self.canvas);
+            ManuallyDrop::drop(&mut self.document);
+        }
+        unsafe { state.restore(&self.state_gl) };
     }
 }
 
@@ -301,7 +352,7 @@ mod tests {
         let mut preview = session(400, 200);
         preview.set_canvas_size(800.0, 600.0);
         preview.rotate_clockwise();
-        let origin = Point::new(0.0, 86.0);
+        let origin = Point::new(0.0, crate::model::preview::PREVIEW_HEADER_HEIGHT);
         let transform = scene_transform(preview.view(), origin, 1.5);
         let document = Point::new(37.0, 91.0);
         let expected = (preview.view().document_to_canvas(document) + origin) * 1.5;

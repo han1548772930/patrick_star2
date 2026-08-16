@@ -51,6 +51,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_POPUP, WS_THICKFRAME, XBUTTON1, XBUTTON2,
 };
 
+use crate::model::preview::{
+    PREVIEW_HEADER_HEIGHT, PREVIEW_STATUS_HEIGHT, PREVIEW_TITLEBAR_HEIGHT,
+};
+
 use super::{capture_exclusion, wgl};
 
 const CLASS_NAME: &[u16] = &[
@@ -62,9 +66,10 @@ const CLASS_NAME: &[u16] = &[
 const DEFAULT_LOGICAL_WIDTH: f32 = 1080.0;
 const DEFAULT_LOGICAL_HEIGHT: f32 = 720.0;
 const TITLEBAR_LOGICAL_HEIGHT: f32 = 36.0;
-const TITLEBAR_BUTTONS_LOGICAL_WIDTH: f32 = 132.0;
-const PREVIEW_HEADER_LOGICAL_HEIGHT: f32 = 86.0;
-const PREVIEW_STATUS_LOGICAL_HEIGHT: f32 = 28.0;
+const TITLEBAR_BUTTONS_LOGICAL_WIDTH: f32 = 44.0;
+const PREVIEW_LEFT_COMMANDS_LOGICAL_WIDTH: f32 = 240.0;
+const PREVIEW_RIGHT_COMMANDS_LOGICAL_WIDTH: f32 = 216.0;
+const PREVIEW_DRAWING_COMMANDS_LOGICAL_WIDTH: f32 = 340.0;
 const OCR_PANEL_MIN_LOGICAL_WIDTH: f32 = 280.0;
 const OCR_PANEL_MAX_LOGICAL_WIDTH: f32 = 360.0;
 const WHEEL_LOGICAL_PIXELS_PER_NOTCH: f32 = 60.0;
@@ -472,19 +477,8 @@ impl NativeWindow {
         } else {
             resize_border(self.dpi.get())
         };
-        let titlebar_height =
-            logical_length_to_physical(TITLEBAR_LOGICAL_HEIGHT, self.scale_factor());
-        let titlebar_buttons_width =
-            logical_length_to_physical(TITLEBAR_BUTTONS_LOGICAL_WIDTH, self.scale_factor());
-        hit_test_region(
-            width,
-            height,
-            x,
-            y,
-            border,
-            titlebar_height,
-            titlebar_buttons_width,
-        ) as LRESULT
+        let titlebar = titlebar_hit_layout(self.content_kind.get(), self.scale_factor());
+        hit_test_region(width, height, x, y, border, titlebar) as LRESULT
     }
 
     fn apply_client_cursor(&self) {
@@ -902,8 +896,7 @@ fn hit_test_region(
     x: i32,
     y: i32,
     border: i32,
-    titlebar_height: i32,
-    titlebar_buttons_width: i32,
+    titlebar: TitlebarHitLayout,
 ) -> u32 {
     let left = border > 0 && x >= 0 && x < border;
     let right = border > 0 && x < width && x >= width - border;
@@ -918,14 +911,41 @@ fn hit_test_region(
         (_, true, _, _) => HTRIGHT,
         (_, _, true, _) => HTTOP,
         (_, _, _, true) => HTBOTTOM,
-        _ if x >= 0
-            && x < (width - titlebar_buttons_width).max(0)
+        _ if x >= titlebar.drag_left
+            && x < (width - titlebar.drag_right).max(titlebar.drag_left)
             && y >= 0
-            && y < titlebar_height =>
+            && y < titlebar.height =>
         {
             HTCAPTION
         }
         _ => HTCLIENT,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TitlebarHitLayout {
+    height: i32,
+    drag_left: i32,
+    drag_right: i32,
+}
+
+fn titlebar_hit_layout(kind: WindowContentKind, scale_factor: f32) -> TitlebarHitLayout {
+    let (height, drag_left, drag_right) = match kind {
+        WindowContentKind::Preview | WindowContentKind::OcrPreview => (
+            PREVIEW_TITLEBAR_HEIGHT,
+            PREVIEW_LEFT_COMMANDS_LOGICAL_WIDTH,
+            PREVIEW_RIGHT_COMMANDS_LOGICAL_WIDTH,
+        ),
+        WindowContentKind::Other => (TITLEBAR_LOGICAL_HEIGHT, 0.0, TITLEBAR_BUTTONS_LOGICAL_WIDTH),
+    };
+    TitlebarHitLayout {
+        height: logical_length_to_physical(height, scale_factor),
+        drag_left: if drag_left == 0.0 {
+            0
+        } else {
+            logical_length_to_physical(drag_left, scale_factor)
+        },
+        drag_right: logical_length_to_physical(drag_right, scale_factor),
     }
 }
 
@@ -982,10 +1002,13 @@ fn client_cursor(
     if x < 0 || y < 0 || x >= width || y >= height {
         return ClientCursor::Arrow;
     }
-    let titlebar_height = logical_length_to_physical(TITLEBAR_LOGICAL_HEIGHT, scale_factor);
-    let titlebar_buttons = logical_length_to_physical(TITLEBAR_BUTTONS_LOGICAL_WIDTH, scale_factor);
-    if y < titlebar_height && x >= (width - titlebar_buttons).max(0) {
-        return ClientCursor::Hand;
+    let titlebar = titlebar_hit_layout(kind, scale_factor);
+    if y < titlebar.height {
+        return if x < titlebar.drag_left || x >= (width - titlebar.drag_right).max(0) {
+            ClientCursor::Hand
+        } else {
+            ClientCursor::Arrow
+        };
     }
     if !matches!(
         kind,
@@ -994,11 +1017,17 @@ fn client_cursor(
         return ClientCursor::Arrow;
     }
 
-    let header_height = logical_length_to_physical(PREVIEW_HEADER_LOGICAL_HEIGHT, scale_factor);
-    if y >= titlebar_height && y < header_height {
-        return ClientCursor::Hand;
+    let header_height = logical_length_to_physical(PREVIEW_HEADER_HEIGHT, scale_factor);
+    if y < header_height {
+        let commands =
+            logical_length_to_physical(PREVIEW_DRAWING_COMMANDS_LOGICAL_WIDTH, scale_factor);
+        return if x < commands {
+            ClientCursor::Hand
+        } else {
+            ClientCursor::Arrow
+        };
     }
-    let status_height = logical_length_to_physical(PREVIEW_STATUS_LOGICAL_HEIGHT, scale_factor);
+    let status_height = logical_length_to_physical(PREVIEW_STATUS_HEIGHT, scale_factor);
     if y < header_height || y >= height.saturating_sub(status_height) {
         return ClientCursor::Arrow;
     }
@@ -1085,6 +1114,10 @@ fn platform_error(message: impl Into<String>) -> PlatformError {
 mod tests {
     use super::*;
 
+    fn preview_titlebar() -> TitlebarHitLayout {
+        titlebar_hit_layout(WindowContentKind::Preview, 1.0)
+    }
+
     #[test]
     fn logical_lengths_follow_dpi_scale() {
         assert_eq!(logical_length_to_physical(100.0, 1.0), 100);
@@ -1094,15 +1127,18 @@ mod tests {
 
     #[test]
     fn resize_edges_take_priority_over_custom_titlebar() {
-        assert_eq!(hit_test_region(1080, 720, 2, 2, 8, 36, 132), HTTOPLEFT);
-        assert_eq!(hit_test_region(1080, 720, 500, 2, 8, 36, 132), HTTOP);
-        assert_eq!(hit_test_region(1080, 720, 500, 20, 8, 36, 132), HTCAPTION);
+        let titlebar = preview_titlebar();
+        assert_eq!(hit_test_region(1080, 720, 2, 2, 8, titlebar), HTTOPLEFT);
+        assert_eq!(hit_test_region(1080, 720, 500, 2, 8, titlebar), HTTOP);
+        assert_eq!(hit_test_region(1080, 720, 500, 20, 8, titlebar), HTCAPTION);
     }
 
     #[test]
-    fn titlebar_buttons_remain_slint_client_area() {
-        assert_eq!(hit_test_region(1080, 720, 1000, 20, 8, 36, 132), HTCLIENT);
-        assert_eq!(hit_test_region(1080, 720, 500, 100, 8, 36, 132), HTCLIENT);
+    fn titlebar_commands_and_caption_buttons_remain_slint_client_area() {
+        let titlebar = preview_titlebar();
+        assert_eq!(hit_test_region(1080, 720, 100, 20, 8, titlebar), HTCLIENT);
+        assert_eq!(hit_test_region(1080, 720, 1000, 20, 8, titlebar), HTCLIENT);
+        assert_eq!(hit_test_region(1080, 720, 500, 100, 8, titlebar), HTCLIENT);
     }
 
     #[test]
@@ -1113,8 +1149,12 @@ mod tests {
             ClientCursor::Hand
         );
         assert_eq!(
-            client_cursor(kind, 1080, 720, 200, 60, 1.0),
+            client_cursor(kind, 1080, 720, 200, 45, 1.0),
             ClientCursor::Hand
+        );
+        assert_eq!(
+            client_cursor(kind, 1080, 720, 500, 20, 1.0),
+            ClientCursor::Arrow
         );
         assert_eq!(
             client_cursor(kind, 1080, 720, 400, 300, 1.0),
@@ -1134,7 +1174,7 @@ mod tests {
     fn ocr_cursor_regions_scale_with_window_dpi() {
         let kind = WindowContentKind::OcrPreview;
         assert_eq!(
-            client_cursor(kind, 1620, 1080, 300, 90, 1.5),
+            client_cursor(kind, 1620, 1080, 300, 70, 1.5),
             ClientCursor::Hand
         );
         assert_eq!(
@@ -1145,7 +1185,8 @@ mod tests {
 
     #[test]
     fn maximized_window_has_no_resize_edge() {
-        assert_eq!(hit_test_region(1080, 720, 2, 2, 0, 36, 132), HTCAPTION);
+        let titlebar = preview_titlebar();
+        assert_eq!(hit_test_region(1080, 720, 500, 2, 0, titlebar), HTCAPTION);
     }
 
     #[test]

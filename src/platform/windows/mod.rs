@@ -19,14 +19,14 @@ mod window_locator;
 
 use std::rc::Rc;
 
-use crate::model::{CaptureOutcome, DesktopFrame, RgbaFrame};
+use crate::model::{DesktopFrame, RgbaFrame};
 use crate::ocr::{OcrDocument, OcrLanguage, TextRecognizer};
 use crate::platform::{
-    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, DesktopCapture,
-    DirectoryPicker, GlobalShortcutHost, GlobalShortcutRegistration, ImageClipboard,
-    ImageSaveDialog, ImageSaveTarget, PinnedImageHost, PlatformCapabilities, ScrollCaptureSource,
-    ScrollPreview, ScrollPreviewHost, Shortcut, SingleInstanceGuard, SingleInstanceHost,
-    TextClipboard,
+    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, CaptureOverlayResult,
+    DesktopCapture, DirectoryPicker, GlobalShortcutHost, GlobalShortcutRegistration,
+    ImageClipboard, ImageSaveDialog, ImageSaveTarget, PinnedImageHost, PlatformCapabilities,
+    ScrollCaptureSource, ScrollPreview, ScrollPreviewHost, Shortcut, SingleInstanceGuard,
+    SingleInstanceHost, TextClipboard,
 };
 
 pub struct Backend;
@@ -77,7 +77,7 @@ impl CaptureOverlay for Backend {
         &self,
         frame: DesktopFrame,
         features: crate::model::OverlayFeatures,
-    ) -> anyhow::Result<CaptureOutcome> {
+    ) -> anyhow::Result<CaptureOverlayResult> {
         overlay::run(frame, features)
     }
 }

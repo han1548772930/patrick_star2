@@ -4,13 +4,13 @@ mod single_instance;
 mod wayland;
 mod x11;
 
-use crate::model::{CaptureOutcome, DesktopFrame, RgbaFrame};
+use crate::model::{DesktopFrame, RgbaFrame};
 use crate::ocr::{OcrDocument, OcrLanguage, TextRecognizer};
 use crate::platform::{
-    ActiveScrollCapture, Capabilities, CaptureOverlay, DesktopCapture, DirectoryPicker,
-    ImageClipboard, ImageSaveDialog, ImageSaveTarget, PinnedImageHost, PlatformCapabilities,
-    ScrollCaptureSource, ScrollPreview, ScrollPreviewHost, SingleInstanceGuard, SingleInstanceHost,
-    TextClipboard,
+    ActiveScrollCapture, Capabilities, CaptureOverlay, CaptureOverlayResult, DesktopCapture,
+    DirectoryPicker, ImageClipboard, ImageSaveDialog, ImageSaveTarget, PinnedImageHost,
+    PlatformCapabilities, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost,
+    SingleInstanceGuard, SingleInstanceHost, TextClipboard,
 };
 
 pub struct Backend {
@@ -47,7 +47,7 @@ impl CaptureOverlay for Backend {
         &self,
         frame: DesktopFrame,
         features: crate::model::OverlayFeatures,
-    ) -> anyhow::Result<CaptureOutcome> {
+    ) -> anyhow::Result<CaptureOverlayResult> {
         match &self.session {
             Session::X11(backend) => backend.run_capture_overlay(frame, features),
             Session::Wayland(backend) => backend.run_capture_overlay(frame, features),

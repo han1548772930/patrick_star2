@@ -1,5 +1,9 @@
 use super::{Editor, EditorKey, Point, Rect, RgbaFrame, Tool};
 
+pub const PREVIEW_TITLEBAR_HEIGHT: f32 = 30.0;
+pub const PREVIEW_HEADER_HEIGHT: f32 = 60.0;
+pub const PREVIEW_STATUS_HEIGHT: f32 = 28.0;
+
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 32.0;
 

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CombineRgn, CreateRectRgn, DeleteObject, EndPaint, InvalidateRect, PAINTSTRUCT,
     RGN_DIFF, SetWindowRgn, UpdateWindow,
@@ -15,8 +16,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
-    GetWindowLongPtrW, IDC_ARROW, IDC_HAND, IsWindow, LoadCursorW, RegisterClassExW, SW_SHOW,
-    SetCursor, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY,
+    GetWindowLongPtrW, IDC_ARROW, IDC_HAND, IsWindow, LoadCursorW, RegisterClassExW, SW_HIDE,
+    SW_SHOW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR,
     WM_SIZE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -107,6 +108,7 @@ pub(super) fn open(background: &DesktopFrame, selection: RectI) -> Result<Box<Wi
         height: bounds.height(),
         hovered: None,
         pressed: None,
+        visible: false,
         error: None,
     });
     unsafe {
@@ -115,6 +117,7 @@ pub(super) fn open(background: &DesktopFrame, selection: RectI) -> Result<Box<Wi
         SetForegroundWindow(hwnd);
         UpdateWindow(hwnd);
     }
+    window.visible = true;
     Ok(window)
 }
 
@@ -127,6 +130,7 @@ pub(super) struct Window {
     height: u32,
     hovered: Option<ScrollAction>,
     pressed: Option<ScrollAction>,
+    visible: bool,
     error: Option<anyhow::Error>,
 }
 
@@ -173,10 +177,25 @@ impl Window {
         };
         unsafe { SetCursor(LoadCursorW(null_mut(), cursor)) };
     }
+
+    pub(super) fn hide_for_close(&mut self) -> bool {
+        if !self.visible || unsafe { IsWindow(self.hwnd) } == 0 {
+            return false;
+        }
+        unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        self.visible = false;
+        true
+    }
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
+        unsafe { ReleaseCapture() };
+        if self.hide_for_close() {
+            unsafe {
+                let _ = DwmFlush();
+            }
+        }
         unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) };
         if let Some(surface) = self.surface.as_ref() {
             let _ = surface.ensure_current();
@@ -234,9 +253,10 @@ unsafe extern "system" fn window_proc(
                 .take()
                 .filter(|pressed| Some(*pressed) == released);
             state.hovered = released;
-            state.invalidate();
             if let Some(action) = action {
                 scroll_capture::request(action);
+            } else {
+                state.invalidate();
             }
             0
         }

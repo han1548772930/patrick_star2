@@ -2,12 +2,12 @@
 
 mod single_instance;
 
-use crate::model::{CaptureOutcome, DesktopFrame, RgbaFrame};
+use crate::model::{DesktopFrame, RgbaFrame};
 use crate::ocr::{OcrDocument, OcrLanguage, TextRecognizer};
 use crate::platform::{
-    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, DesktopCapture,
-    DirectoryPicker, ImageClipboard, ImageSaveDialog, ImageSaveTarget, PinnedImageHost,
-    PlatformCapabilities, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost,
+    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, CaptureOverlayResult,
+    DesktopCapture, DirectoryPicker, ImageClipboard, ImageSaveDialog, ImageSaveTarget,
+    PinnedImageHost, PlatformCapabilities, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost,
     SingleInstanceGuard, SingleInstanceHost, TextClipboard,
 };
 
@@ -24,7 +24,7 @@ impl CaptureOverlay for Backend {
         &self,
         _frame: DesktopFrame,
         _features: crate::model::OverlayFeatures,
-    ) -> anyhow::Result<CaptureOutcome> {
+    ) -> anyhow::Result<CaptureOverlayResult> {
         anyhow::bail!("macOS AppKit/OpenGL overlay backend is not implemented yet")
     }
 }

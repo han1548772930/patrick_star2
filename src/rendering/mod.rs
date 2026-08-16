@@ -1,6 +1,7 @@
 //! Shared OpenGL and FemtoVG renderer used by native platform windows.
 
 mod emoji;
+mod gl_state;
 mod icons;
 mod image;
 mod opengl;

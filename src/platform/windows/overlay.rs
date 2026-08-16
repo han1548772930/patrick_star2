@@ -16,18 +16,21 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage,
-    RegisterClassExW, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SIZE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, IsWindow, LoadCursorW, MSG,
+    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
+    ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::model::{
     CaptureIntent, CaptureOutcome, DesktopFrame, EditorKey, OverlayAction, OverlayFeatures,
     OverlayLayout, OverlaySession, Point, PointI, Rect, Tool,
 };
-use crate::platform::{NativeCursorHost, WindowLocator};
+use crate::platform::{
+    CaptureOverlayHandoff, CaptureOverlayResult, NativeCursorHost, WindowLocator,
+};
 use crate::rendering::OverlayRenderer;
 
 use super::{cursor, wgl, window_locator};
@@ -38,7 +41,7 @@ const CLASS_NAME: &[u16] = &[
     'l' as u16, 'a' as u16, 'y' as u16, 0,
 ];
 
-pub fn run(frame: DesktopFrame, features: OverlayFeatures) -> Result<CaptureOutcome> {
+pub fn run(frame: DesktopFrame, features: OverlayFeatures) -> Result<CaptureOverlayResult> {
     let instance = unsafe { GetModuleHandleW(null()) };
     anyhow::ensure!(!instance.is_null(), "GetModuleHandleW failed");
     let class = WNDCLASSEXW {
@@ -76,7 +79,13 @@ pub fn run(frame: DesktopFrame, features: OverlayFeatures) -> Result<CaptureOutc
     anyhow::ensure!(!hwnd.is_null(), "CreateWindowExW failed");
 
     let result = run_window(hwnd, frame, features);
-    unsafe { DestroyWindow(hwnd) };
+    if !result
+        .as_ref()
+        .is_ok_and(|result| result.handoff.is_some())
+        && unsafe { IsWindow(hwnd) } != 0
+    {
+        unsafe { DestroyWindow(hwnd) };
+    }
     result
 }
 
@@ -84,7 +93,7 @@ fn run_window(
     hwnd: HWND,
     frame: DesktopFrame,
     features: OverlayFeatures,
-) -> Result<CaptureOutcome> {
+) -> Result<CaptureOverlayResult> {
     let surface = wgl::Surface::new(hwnd).context("failed to create WGL surface")?;
     let mut renderer = unsafe {
         OverlayRenderer::new(&frame, |name| surface.proc_address(name))
@@ -130,23 +139,66 @@ fn run_window(
     }
 
     let loop_result = message_loop();
-    unsafe {
-        // Hide while the window and its front buffer are still valid. Destroying
-        // the WGL resources first can leave the final dimmed frame in DWM until
-        // another desktop window happens to invalidate that area.
-        ReleaseCapture();
-        ShowWindow(hwnd, SW_HIDE);
-        let _ = DwmFlush();
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-    }
     let outcome = std::mem::replace(&mut state.outcome, CaptureOutcome::Cancelled);
     let error = state.error.take();
+
+    let keep_until_scroll_overlay_is_ready = loop_result.is_ok()
+        && error.is_none()
+        && matches!(
+            &outcome,
+            CaptureOutcome::Confirmed {
+                intent: CaptureIntent::ScrollCapture,
+                ..
+            }
+        );
+    if keep_until_scroll_overlay_is_ready {
+        return Ok(CaptureOverlayResult {
+            outcome,
+            handoff: Some(Box::new(WindowsOverlayHandoff {
+                hwnd,
+                state: Some(state),
+            })),
+        });
+    }
+
+    close_overlay(hwnd, &mut state);
     drop(state);
     loop_result?;
     if let Some(error) = error {
         return Err(error.context("failed to export capture"));
     }
-    Ok(outcome)
+    Ok(CaptureOverlayResult::complete(outcome))
+}
+
+struct WindowsOverlayHandoff {
+    hwnd: HWND,
+    state: Option<Box<WindowState>>,
+}
+
+impl CaptureOverlayHandoff for WindowsOverlayHandoff {}
+
+impl Drop for WindowsOverlayHandoff {
+    fn drop(&mut self) {
+        if let Some(mut state) = self.state.take() {
+            close_overlay(self.hwnd, &mut state);
+            drop(state);
+        }
+        if unsafe { IsWindow(self.hwnd) } != 0 {
+            unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+}
+
+fn close_overlay(hwnd: HWND, state: &mut WindowState) {
+    unsafe {
+        // Keep the final front buffer valid until the window is hidden. Otherwise
+        // DWM can retain the dimmed desktop after the OpenGL context is destroyed.
+        ReleaseCapture();
+        ShowWindow(hwnd, SW_HIDE);
+        let _ = DwmFlush();
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
+    let _ = state.surface.ensure_current();
 }
 
 fn prepare_annotation_smoke(session: &mut OverlaySession, surface: Rect, tool: Tool) {

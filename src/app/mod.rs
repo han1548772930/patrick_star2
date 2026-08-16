@@ -6,14 +6,16 @@ use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 
 use crate::model::{CaptureIntent, CaptureOutcome, DesktopFrame, OverlayFeatures, RgbaFrame};
 use crate::ocr::TextRecognizer;
 use crate::platform::{
-    Availability, DirectoryPicker, GlobalShortcutHost, GlobalShortcutRegistration, ImageClipboard,
-    ImageSaveDialog, PlatformBackend, PlatformCapabilities, ScrollCaptureEvent,
-    ScrollCaptureIntent, ScrollCaptureSource, Shortcut, SingleInstanceHost, TextClipboard,
+    Availability, CaptureOverlayHandoff, CaptureOverlayResult, DirectoryPicker,
+    GlobalShortcutHost, GlobalShortcutRegistration, ImageClipboard, ImageSaveDialog,
+    PlatformBackend, PlatformCapabilities, ScrollCaptureEvent, ScrollCaptureIntent,
+    ScrollCaptureSource, Shortcut, SingleInstanceHost, TextClipboard,
 };
 #[cfg(feature = "opencv-orb")]
 use crate::scroll::{OpenCvOrbMatcher, PushOutcome, ScrollConfig, ScrollSession};
@@ -121,11 +123,13 @@ fn capture_once(
     );
     let frame = backend.capture_virtual_desktop()?;
     let features = overlay_features(capabilities);
+    let CaptureOverlayResult { outcome, handoff } =
+        backend.run_capture_overlay(frame, features)?;
     let CaptureOutcome::Confirmed {
         image,
         intent,
         desktop,
-    } = backend.run_capture_overlay(frame, features)?
+    } = outcome
     else {
         return Ok(None);
     };
@@ -177,6 +181,7 @@ fn capture_once(
                     desktop,
                 },
                 save_directory: settings.save_directory.clone(),
+                handoff,
             }));
         }
     }
@@ -192,6 +197,7 @@ enum DeferredCaptureTask {
     Scroll {
         task: ScrollCaptureTask,
         save_directory: std::path::PathBuf,
+        handoff: Option<Box<dyn CaptureOverlayHandoff>>,
     },
 }
 
@@ -218,7 +224,8 @@ fn start_deferred_capture_worker(
         DeferredCaptureTask::Scroll {
             task,
             save_directory,
-        } => start_scroll_capture_worker(task, save_directory, active),
+            handoff,
+        } => start_scroll_capture_worker(task, save_directory, active, handoff),
     }
 }
 
@@ -266,12 +273,22 @@ fn start_scroll_capture_worker(
     task: ScrollCaptureTask,
     save_directory: std::path::PathBuf,
     active: Arc<AtomicBool>,
+    handoff: Option<Box<dyn CaptureOverlayHandoff>>,
 ) -> anyhow::Result<()> {
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
     std::thread::Builder::new()
         .name("patrick-star-scroll".into())
         .spawn(move || {
-            let result =
-                run_scroll_capture(&crate::platform::current(), &task.desktop, task.initial);
+            let result = run_scroll_capture(
+                &crate::platform::current(),
+                &task.desktop,
+                task.initial,
+                || {
+                    ready_sender
+                        .send(())
+                        .map_err(|_| anyhow::anyhow!("scroll overlay handoff receiver was dropped"))
+                },
+            );
             active.store(false, Ordering::Release);
             match result {
                 Ok(Some(output)) => {
@@ -288,6 +305,10 @@ fn start_scroll_capture_worker(
             }
         })
         .context("spawn scroll capture worker")?;
+    ready_receiver
+        .recv()
+        .context("scroll capture stopped before its native windows were ready")?;
+    drop(handoff);
     Ok(())
 }
 
@@ -436,6 +457,7 @@ fn run_scroll_capture(
     backend: &impl PlatformBackend,
     desktop: &DesktopFrame,
     initial: RgbaFrame,
+    ready: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<Option<ScrollCaptureOutput>> {
     let capabilities = backend.capabilities();
     anyhow::ensure!(
@@ -449,6 +471,7 @@ fn run_scroll_capture(
 
     let mut capture = backend.start_scroll_capture(initial.bounds())?;
     let mut preview = backend.open_scroll_preview(desktop, &initial)?;
+    ready()?;
     let matcher = OpenCvOrbMatcher::new(1_200)?;
     let mut session = ScrollSession::new(initial, matcher, ScrollConfig::default());
     loop {
@@ -479,6 +502,7 @@ fn run_scroll_capture(
     _backend: &impl PlatformBackend,
     _desktop: &DesktopFrame,
     _initial: RgbaFrame,
+    _ready: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<Option<ScrollCaptureOutput>> {
     anyhow::bail!("scroll capture requires the opencv-orb feature")
 }

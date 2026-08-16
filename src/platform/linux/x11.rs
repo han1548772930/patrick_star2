@@ -1,11 +1,12 @@
 //! X11/XCB capture, EWMH window discovery, and GLX/EGL window hosting.
 
-use crate::model::{CaptureOutcome, DesktopFrame, RgbaFrame};
+use crate::model::{DesktopFrame, RgbaFrame};
 use crate::ocr::{OcrDocument, OcrLanguage, TextRecognizer};
 use crate::platform::{
-    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, DesktopCapture,
-    DirectoryPicker, ImageClipboard, ImageSaveDialog, ImageSaveTarget, PinnedImageHost,
-    PlatformCapabilities, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost, TextClipboard,
+    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, CaptureOverlayResult,
+    DesktopCapture, DirectoryPicker, ImageClipboard, ImageSaveDialog, ImageSaveTarget,
+    PinnedImageHost, PlatformCapabilities, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost,
+    TextClipboard,
 };
 
 pub struct Backend;
@@ -21,7 +22,7 @@ impl CaptureOverlay for Backend {
         &self,
         _frame: DesktopFrame,
         _features: crate::model::OverlayFeatures,
-    ) -> anyhow::Result<CaptureOutcome> {
+    ) -> anyhow::Result<CaptureOverlayResult> {
         anyhow::bail!("X11 GLX/EGL overlay backend is not implemented yet")
     }
 }

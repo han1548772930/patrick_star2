@@ -5,15 +5,17 @@ use anyhow::{Context, Result};
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, UpdateWindow,
+    BeginPaint, EndPaint, PAINTSTRUCT, RDW_INVALIDATE, RDW_NOERASE, RDW_UPDATENOW, RedrawWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetSystemMetrics,
     GetWindowLongPtrW, IDC_ARROW, IsWindow, LoadCursorW, RegisterClassExW, SM_CXVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SW_SHOWNOACTIVATE, SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY,
-    WM_ERASEBKGND, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SM_XVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SetWindowLongPtrW, ShowWindow, WM_CLOSE,
+    WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -37,20 +39,30 @@ const PREVIEW_GAP: i32 = 12;
 pub fn open(desktop: &DesktopFrame, initial: &RgbaFrame) -> Result<Box<dyn ScrollPreview>> {
     let overlay = scroll_overlay::open(desktop, initial.bounds())?;
     let right = open_right(initial)?;
-    Ok(Box::new(WindowsScrollPreview {
-        _overlay: overlay,
-        right,
-    }))
+    Ok(Box::new(WindowsScrollPreview { overlay, right }))
 }
 
 struct WindowsScrollPreview {
-    _overlay: Box<scroll_overlay::Window>,
+    overlay: Box<scroll_overlay::Window>,
     right: Box<RightPreview>,
 }
 
 impl ScrollPreview for WindowsScrollPreview {
     fn update(&mut self, patch: PreviewPatch<'_>) -> Result<()> {
         self.right.update(patch)
+    }
+}
+
+impl Drop for WindowsScrollPreview {
+    fn drop(&mut self) {
+        unsafe { ReleaseCapture() };
+        let overlay_was_visible = self.overlay.hide_for_close();
+        let preview_was_visible = self.right.hide_for_close();
+        if overlay_was_visible || preview_was_visible {
+            unsafe {
+                let _ = DwmFlush();
+            }
+        }
     }
 }
 
@@ -115,9 +127,17 @@ fn open_right(initial: &RgbaFrame) -> Result<Box<RightPreview>> {
         surface: Some(surface),
         width: PREVIEW_WIDTH as u32,
         height: height as u32,
+        visible: false,
         error: None,
     });
-    preview.update(PreviewPatch {
+    unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_USERDATA,
+            (&mut *preview as *mut RightPreview) as isize,
+        );
+    }
+    preview.upload(PreviewPatch {
         document_width: initial.width(),
         document_height: initial.height(),
         region: PreviewRegion {
@@ -127,13 +147,12 @@ fn open_right(initial: &RgbaFrame) -> Result<Box<RightPreview>> {
         rgba: initial.pixels(),
     })?;
     unsafe {
-        SetWindowLongPtrW(
-            hwnd,
-            GWLP_USERDATA,
-            (&mut *preview as *mut RightPreview) as isize,
-        );
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        UpdateWindow(hwnd);
+    }
+    preview.visible = true;
+    preview.redraw_now()?;
+    unsafe {
+        let _ = DwmFlush();
     }
     Ok(preview)
 }
@@ -167,6 +186,7 @@ struct RightPreview {
     surface: Option<wgl::Surface>,
     width: u32,
     height: u32,
+    visible: bool,
     error: Option<anyhow::Error>,
 }
 
@@ -191,6 +211,11 @@ impl RightPreview {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
+        self.upload(patch)?;
+        self.redraw_now()
+    }
+
+    fn upload(&mut self, patch: PreviewPatch<'_>) -> Result<()> {
         self.surface
             .as_ref()
             .context("scroll preview surface is closed")?
@@ -200,19 +225,44 @@ impl RightPreview {
             .as_mut()
             .context("scroll preview renderer is closed")?
             .update(patch)?;
-        unsafe {
-            InvalidateRect(self.hwnd, null(), 0);
-            UpdateWindow(self.hwnd);
-        }
+        Ok(())
+    }
+
+    fn redraw_now(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            unsafe {
+                RedrawWindow(
+                    self.hwnd,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE,
+                )
+            } != 0,
+            "redraw scroll preview failed"
+        );
         if let Some(error) = self.error.take() {
             return Err(error);
         }
         Ok(())
     }
+
+    fn hide_for_close(&mut self) -> bool {
+        if !self.visible || unsafe { IsWindow(self.hwnd) } == 0 {
+            return false;
+        }
+        unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        self.visible = false;
+        true
+    }
 }
 
 impl Drop for RightPreview {
     fn drop(&mut self) {
+        if self.hide_for_close() {
+            unsafe {
+                let _ = DwmFlush();
+            }
+        }
         unsafe { SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) };
         if let Some(surface) = self.surface.as_ref() {
             let _ = surface.ensure_current();
