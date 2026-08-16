@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- 外部空心矩形边框（黑色） -->
+  <rect x="2" y="2" width="20" height="20" rx="2"
+        fill="none" stroke="#000000" stroke-width="2.5"/>
+  <!-- 内部实心矩形（加大，黑色） -->
+  <rect x="5.5" y="5.5" width="13" height="13" rx="1.5"
+        fill="#000000"/>
+</svg>
