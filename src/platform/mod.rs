@@ -12,12 +12,14 @@ mod linux;
 #[allow(unused_imports)]
 pub use api::PlatformWindowActions;
 pub use api::{
-    ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, CaptureOverlayHandoff,
-    CaptureOverlayResult, DesktopCapture, DirectoryPicker, GlobalShortcutHost,
-    GlobalShortcutRegistration, ImageClipboard, ImageFileFormat, ImageSaveDialog, ImageSaveTarget,
-    NativeCursorHost, PinnedImageHost, PlatformBackend, PlatformCapabilities, ScrollCaptureEvent,
-    ScrollCaptureIntent, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost, Shortcut,
-    ShortcutKey, ShortcutModifiers, SingleInstanceGuard, SingleInstanceHost, TextClipboard,
+    ActiveScrollCapture, Availability, Capabilities, CaptionButton, CaptureOverlay,
+    CaptureOverlayHandoff, CaptureOverlayResult, CapturedScrollFrame, DesktopCapture,
+    DirectoryPicker, GlobalShortcutHost, GlobalShortcutRegistration, ImageClipboard,
+    ImageFileFormat, ImageSaveDialog, ImageSaveTarget, NativeCursorHost, PinnedImageHost,
+    PlatformBackend, PlatformCapabilities, ScrollCaptureEvent, ScrollCaptureIntent,
+    ScrollCaptureSource, ScrollDirection, ScrollPreview, ScrollPreviewHost, Shortcut, ShortcutKey,
+    ShortcutModifiers, SingleInstanceGuard, SingleInstanceHost, TextClipboard, WindowFrame,
+    WindowFrameAnchor, WindowFrameClientArea, WindowFrameConfig, WindowFrameEvent, WindowFrameHost,
     WindowLocator,
 };
 
@@ -41,6 +43,15 @@ pub(crate) fn ui_font_paths() -> Vec<std::path::PathBuf> {
     windows::ui_font_paths()
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn set_preview_cursor(
+    window: &slint::Window,
+    cursor: crate::model::PointerCursor,
+    popup: Option<crate::model::Rect>,
+) {
+    windows::set_preview_cursor(window, cursor, popup);
+}
+
 #[cfg(target_os = "macos")]
 pub fn current() -> impl PlatformBackend {
     macos::Backend
@@ -56,6 +67,14 @@ pub(crate) fn ui_font_paths() -> Vec<std::path::PathBuf> {
     .map(std::path::PathBuf::from)
     .filter(|path| path.is_file())
     .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn set_preview_cursor(
+    _window: &slint::Window,
+    _cursor: crate::model::PointerCursor,
+    _popup: Option<crate::model::Rect>,
+) {
 }
 
 #[cfg(target_os = "linux")]

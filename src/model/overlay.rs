@@ -184,9 +184,14 @@ pub struct OptionsLayout {
 }
 
 impl OverlayLayout {
+    #[cfg(test)]
     pub fn for_tool(selection: Rect, surface: Rect, tool: Tool) -> Self {
+        Self::for_tool_scaled(selection, surface, tool, 1.0)
+    }
+
+    pub fn for_tool_scaled(selection: Rect, surface: Rect, tool: Tool, scale: f32) -> Self {
         let (bar, padding, button_gap, button_size) =
-            action_bar(selection, surface, CAPTURE_ACTIONS.len());
+            action_bar(selection, surface, CAPTURE_ACTIONS.len(), scale);
         let buttons = std::array::from_fn(|index| {
             let button_left = bar.left + padding + index as f32 * (button_size + button_gap);
             ActionButton {
@@ -199,7 +204,7 @@ impl OverlayLayout {
                 ),
             }
         });
-        let options = OptionsLayout::new(tool, bar, selection, surface);
+        let options = OptionsLayout::new(tool, bar, selection, surface, scale);
         Self {
             bar,
             buttons,
@@ -220,9 +225,14 @@ impl OverlayLayout {
 }
 
 impl ScrollLayout {
+    #[cfg(test)]
     pub fn new(selection: Rect, surface: Rect) -> Self {
+        Self::new_scaled(selection, surface, 1.0)
+    }
+
+    pub fn new_scaled(selection: Rect, surface: Rect, scale: f32) -> Self {
         let (bar, padding, button_gap, button_size) =
-            action_bar(selection, surface, SCROLL_ACTIONS.len());
+            action_bar(selection, surface, SCROLL_ACTIONS.len(), scale);
         let buttons = std::array::from_fn(|index| {
             let button_left = bar.left + padding + index as f32 * (button_size + button_gap);
             ScrollActionButton {
@@ -246,31 +256,40 @@ impl ScrollLayout {
     }
 }
 
-fn action_bar(selection: Rect, surface: Rect, action_count: usize) -> (Rect, f32, f32, f32) {
+fn action_bar(
+    selection: Rect,
+    surface: Rect,
+    action_count: usize,
+    scale: f32,
+) -> (Rect, f32, f32, f32) {
+    let scale = valid_scale(scale);
     let count = action_count as f32;
-    let nominal_width = BAR_PADDING * 2.0
-        + BUTTON_SIZE * count
-        + BUTTON_GAP * action_count.saturating_sub(1) as f32;
+    let bar_padding = BAR_PADDING * scale;
+    let button_size = BUTTON_SIZE * scale;
+    let button_gap = BUTTON_GAP * scale;
+    let nominal_width = bar_padding * 2.0
+        + button_size * count
+        + button_gap * action_count.saturating_sub(1) as f32;
     let bar_width = nominal_width.min(surface.width().max(0.0));
-    let bar_height = BAR_HEIGHT.min(surface.height().max(0.0));
-    let padding = BAR_PADDING.min(bar_width * 0.05);
-    let gap_budget = (bar_width - padding * 2.0 - count * 12.0).max(0.0);
+    let bar_height = (BAR_HEIGHT * scale).min(surface.height().max(0.0));
+    let padding = bar_padding.min(bar_width * 0.05);
+    let gap_budget = (bar_width - padding * 2.0 - count * 12.0 * scale).max(0.0);
     let button_gap = if action_count > 1 {
-        BUTTON_GAP.min(gap_budget / (action_count - 1) as f32)
+        button_gap.min(gap_budget / (action_count - 1) as f32)
     } else {
         0.0
     };
     let button_size =
         ((bar_width - padding * 2.0 - button_gap * action_count.saturating_sub(1) as f32)
             / count.max(1.0))
-        .clamp(0.0, BUTTON_SIZE)
+        .clamp(0.0, button_size)
         .min(bar_height);
     let centered = (selection.left + selection.right - bar_width) * 0.5;
     let left = centered
         .max(surface.left)
         .min((surface.right - bar_width).max(surface.left));
-    let below = selection.bottom + BAR_GAP;
-    let above = selection.top - BAR_GAP - bar_height;
+    let below = selection.bottom + BAR_GAP * scale;
+    let above = selection.top - BAR_GAP * scale - bar_height;
     let top = if below + bar_height <= surface.bottom {
         below
     } else {
@@ -286,19 +305,20 @@ fn action_bar(selection: Rect, surface: Rect, action_count: usize) -> (Rect, f32
 }
 
 impl OptionsLayout {
-    fn new(tool: Tool, anchor: Rect, selection: Rect, surface: Rect) -> Option<Self> {
+    fn new(tool: Tool, anchor: Rect, selection: Rect, surface: Rect, scale: f32) -> Option<Self> {
+        let scale = valid_scale(scale);
         let (count, columns) = option_grid(tool)?;
         let rows = count.div_ceil(columns);
-        let padding = OPTIONS_PADDING
+        let padding = (OPTIONS_PADDING * scale)
             .min(surface.width() * 0.05)
             .min(surface.height() * 0.05);
-        let gap = OPTION_BUTTON_GAP
+        let gap = (OPTION_BUTTON_GAP * scale)
             .min(((surface.width() - padding * 2.0) / columns as f32).max(0.0) * 0.2);
         let width_for_buttons =
             (surface.width() - padding * 2.0 - gap * columns.saturating_sub(1) as f32).max(0.0);
         let height_for_buttons =
             (surface.height() - padding * 2.0 - gap * rows.saturating_sub(1) as f32).max(0.0);
-        let button_size = OPTION_BUTTON_SIZE
+        let button_size = (OPTION_BUTTON_SIZE * scale)
             .min(width_for_buttons / columns as f32)
             .min(height_for_buttons / rows as f32)
             .max(0.0);
@@ -310,8 +330,8 @@ impl OptionsLayout {
             .max(surface.left)
             .min((surface.right - width).max(surface.left));
         let prefer_below = anchor.top >= selection.bottom;
-        let below = anchor.bottom + OPTIONS_GAP;
-        let above = anchor.top - OPTIONS_GAP - height;
+        let below = anchor.bottom + OPTIONS_GAP * scale;
+        let above = anchor.top - OPTIONS_GAP * scale - height;
         let preferred = if prefer_below { below } else { above };
         let alternate = if prefer_below { above } else { below };
         let fits = |top: f32| top >= surface.top && top + height <= surface.bottom;
@@ -365,6 +385,14 @@ impl OptionsLayout {
         self.buttons()
             .find(|button| button.bounds.contains(point))
             .map(|button| button.action)
+    }
+}
+
+fn valid_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(0.5, 4.0)
+    } else {
+        1.0
     }
 }
 
@@ -500,6 +528,27 @@ mod tests {
             OverlayLayout::for_tool(Rect::new(100.0, 500.0, 780.0, 590.0), SURFACE, Tool::Select);
         assert_eq!(layout.bar.top, 457.0);
         assert!(layout.bar.right <= SURFACE.right);
+    }
+
+    #[test]
+    fn toolbar_geometry_and_hit_testing_follow_window_dpi() {
+        let surface = Rect::new(0.0, 0.0, 1800.0, 1200.0);
+        let selection = Rect::new(400.0, 200.0, 1400.0, 800.0);
+        let normal = OverlayLayout::for_tool_scaled(selection, surface, Tool::Rectangle, 1.0);
+        let hidpi = OverlayLayout::for_tool_scaled(selection, surface, Tool::Rectangle, 1.5);
+
+        assert_eq!(normal.bar.height(), 40.0);
+        assert_eq!(hidpi.bar.height(), 60.0);
+        assert_eq!(normal.buttons[0].bounds.width(), 30.0);
+        assert_eq!(hidpi.buttons[0].bounds.width(), 45.0);
+        assert_eq!(
+            hidpi.action_at(hidpi.buttons[0].bounds.center()),
+            Some(OverlayAction::Tool(Tool::Rectangle))
+        );
+        assert_eq!(
+            hidpi.options.unwrap().button(0).unwrap().bounds.width(),
+            42.0
+        );
     }
 
     #[test]

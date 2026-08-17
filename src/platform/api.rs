@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::model::{
     CaptureOutcome, DesktopFrame, DetectedTarget, OverlayFeatures, PointI, PointerCursor, RgbaFrame,
@@ -28,6 +29,7 @@ pub struct Capabilities {
     pub global_shortcut: Availability,
     pub tray: Availability,
     pub capture_exclusion: Availability,
+    pub window_frame: Availability,
 }
 
 pub trait DesktopCapture {
@@ -102,9 +104,41 @@ pub trait PinnedImageHost {
     fn show_pinned_image(&self, image: RgbaFrame) -> anyhow::Result<()>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Unknown,
+}
+
+/// Platform-neutral frame and input metadata produced by a scrolling source.
+#[derive(Clone)]
+pub struct CapturedScrollFrame {
+    pub frame: RgbaFrame,
+    pub captured_at: Instant,
+    pub direction: ScrollDirection,
+    pub wheel_sequence: u64,
+    pub native_scroll_position: Option<i64>,
+    pub discontinuity: bool,
+}
+
+impl std::fmt::Debug for CapturedScrollFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedScrollFrame")
+            .field("bounds", &self.frame.bounds())
+            .field("captured_at", &self.captured_at)
+            .field("direction", &self.direction)
+            .field("wheel_sequence", &self.wheel_sequence)
+            .field("native_scroll_position", &self.native_scroll_position)
+            .field("discontinuity", &self.discontinuity)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub enum ScrollCaptureEvent {
-    Frame(RgbaFrame),
+    Frame(CapturedScrollFrame),
     Finished(ScrollCaptureIntent),
     Cancelled,
 }
@@ -139,6 +173,82 @@ pub trait ScrollPreviewHost {
         desktop: &DesktopFrame,
         initial: &RgbaFrame,
     ) -> anyhow::Result<Box<dyn ScrollPreview>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameAnchor {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowFrameClientArea {
+    pub anchor: WindowFrameAnchor,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl WindowFrameClientArea {
+    pub const fn left(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            anchor: WindowFrameAnchor::Left,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub const fn right(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            anchor: WindowFrameAnchor::Right,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrameConfig {
+    pub titlebar_height: f32,
+    pub caption_button_width: f32,
+    pub minimum_width: f32,
+    pub minimum_height: f32,
+    pub rounded_corners: bool,
+    pub always_on_top: bool,
+    pub client_areas: Vec<WindowFrameClientArea>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowFrameEvent {
+    Installed,
+    CaptionHoverChanged(Option<CaptionButton>),
+    Detached,
+    Failed(String),
+}
+
+/// Keeps a platform window frame attached for at least as long as the UI window.
+pub trait WindowFrame {}
+
+/// Installs native window-manager behavior around an existing Slint window.
+pub trait WindowFrameHost {
+    fn attach_window_frame(
+        &self,
+        window: &slint::Window,
+        config: WindowFrameConfig,
+        on_event: Box<dyn Fn(WindowFrameEvent) + 'static>,
+    ) -> anyhow::Result<Box<dyn WindowFrame>>;
 }
 
 pub trait PlatformCapabilities {
@@ -208,6 +318,7 @@ pub trait PlatformBackend:
     + PinnedImageHost
     + ScrollCaptureSource
     + ScrollPreviewHost
+    + WindowFrameHost
     + TextRecognizer
     + PlatformCapabilities
 {
@@ -224,6 +335,7 @@ impl<T> PlatformBackend for T where
         + PinnedImageHost
         + ScrollCaptureSource
         + ScrollPreviewHost
+        + WindowFrameHost
         + TextRecognizer
         + PlatformCapabilities
 {

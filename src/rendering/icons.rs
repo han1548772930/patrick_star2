@@ -143,15 +143,22 @@ impl ToolbarIcons {
         action: OverlayAction,
         bounds: Rect,
         color: Color,
+        dpi_scale: f32,
     ) {
         let Some(icon) = icon_for_action(action) else {
             return;
         };
-        paint_image(canvas, self.items[icon as usize], bounds, color);
+        paint_image(canvas, self.items[icon as usize], bounds, color, dpi_scale);
     }
 
-    pub fn paint_fill(&self, canvas: &mut Canvas<OpenGl>, bounds: Rect, color: Color) {
-        paint_image(canvas, self.fill_option, bounds, color);
+    pub fn paint_fill(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        bounds: Rect,
+        color: Color,
+        dpi_scale: f32,
+    ) {
+        paint_image(canvas, self.fill_option, bounds, color, dpi_scale);
     }
 }
 
@@ -191,8 +198,14 @@ fn rasterize_svg(source: &[u8]) -> Result<Vec<RGBA8>> {
         .collect())
 }
 
-fn paint_image(canvas: &mut Canvas<OpenGl>, image: ImageId, bounds: Rect, tint: Color) {
-    let bounds = icon_bounds(bounds);
+fn paint_image(
+    canvas: &mut Canvas<OpenGl>,
+    image: ImageId,
+    bounds: Rect,
+    tint: Color,
+    dpi_scale: f32,
+) {
+    let bounds = icon_bounds(bounds, dpi_scale);
     let size = bounds.width();
     if size <= 0.0 {
         return;
@@ -205,8 +218,9 @@ fn paint_image(canvas: &mut Canvas<OpenGl>, image: ImageId, bounds: Rect, tint: 
     );
 }
 
-fn icon_bounds(bounds: Rect) -> Rect {
-    let size = (bounds.width().min(bounds.height()) * ICON_SIZE_RATIO).clamp(0.0, ICON_MAX_SIZE);
+fn icon_bounds(bounds: Rect, dpi_scale: f32) -> Rect {
+    let maximum = ICON_MAX_SIZE * dpi_scale.clamp(0.5, 4.0);
+    let size = (bounds.width().min(bounds.height()) * ICON_SIZE_RATIO).clamp(0.0, maximum);
     let center = bounds.center();
     Rect::new(
         center.x - size * 0.5,
@@ -365,8 +379,10 @@ mod tests {
     #[test]
     fn normal_toolbar_buttons_use_the_original_18_pixel_glyph_size() {
         let button = Rect::new(10.0, 20.0, 40.0, 50.0);
-        let icon = icon_bounds(button);
+        let icon = icon_bounds(button, 1.0);
         assert_eq!(icon, Rect::new(16.0, 26.0, 34.0, 44.0));
+        let hidpi = icon_bounds(Rect::new(10.0, 20.0, 55.0, 65.0), 1.5);
+        assert_eq!(hidpi, Rect::new(19.0, 29.0, 46.0, 56.0));
         assert_eq!(ICON_IMAGE_FLAGS, ImageFlags::GENERATE_MIPMAPS);
     }
 }

@@ -1,4 +1,7 @@
-use super::{Editor, EditorKey, Point, Rect, RgbaFrame, Tool};
+use super::{
+    EMOTIONS, Editor, EditorKey, MOSAIC_BLOCK_SIZES, OverlayOption, Point, PointerCursor, Rect,
+    RgbaFrame, STROKE_WIDTHS, TEXT_SIZES, TOOLBAR_COLORS, Tool, preview_cursor,
+};
 
 pub const PREVIEW_TITLEBAR_HEIGHT: f32 = 30.0;
 pub const PREVIEW_HEADER_HEIGHT: f32 = 60.0;
@@ -235,6 +238,7 @@ pub struct PreviewSession {
     view: ViewTransform,
     mode: PreviewMode,
     pan_anchor: Option<Point>,
+    cursor: Option<Point>,
 }
 
 impl PreviewSession {
@@ -246,6 +250,7 @@ impl PreviewSession {
             view,
             mode: PreviewMode::Edit,
             pan_anchor: None,
+            cursor: None,
         }
     }
 
@@ -263,6 +268,21 @@ impl PreviewSession {
 
     pub fn mode(&self) -> PreviewMode {
         self.mode
+    }
+
+    pub fn pointer_cursor(&self) -> PointerCursor {
+        if self.mode == PreviewMode::Pan {
+            return if self.pan_anchor.is_some() {
+                PointerCursor::Grabbing
+            } else {
+                PointerCursor::Grab
+            };
+        }
+        let point = self
+            .cursor
+            .map(|point| self.view.canvas_to_document(point))
+            .unwrap_or_else(|| self.view.document_bounds().center());
+        preview_cursor(&self.editor, point, self.view.document_bounds())
     }
 
     pub fn set_canvas_size(&mut self, width: f32, height: f32) -> bool {
@@ -286,8 +306,81 @@ impl PreviewSession {
         true
     }
 
+    pub fn option_active(&self, option: OverlayOption) -> bool {
+        match option {
+            OverlayOption::StrokeWidth(index) => STROKE_WIDTHS
+                .get(index as usize)
+                .is_some_and(|width| (self.editor.stroke().width - width).abs() < f32::EPSILON),
+            OverlayOption::TextSize(index) => TEXT_SIZES
+                .get(index as usize)
+                .is_some_and(|size| (self.editor.text_style().size - size).abs() < f32::EPSILON),
+            OverlayOption::ToggleFill => self.editor.stroke().fill.is_some(),
+            OverlayOption::Color(index) => {
+                TOOLBAR_COLORS.get(index as usize).is_some_and(|color| {
+                    if self.editor.tool() == Tool::Text {
+                        self.editor.text_style().color == *color
+                    } else {
+                        self.editor.stroke().color == *color
+                    }
+                })
+            }
+            OverlayOption::MosaicBlock(index) => MOSAIC_BLOCK_SIZES
+                .get(index as usize)
+                .is_some_and(|size| self.editor.mosaic_block_size() == *size),
+            OverlayOption::Emotion(index) => EMOTIONS
+                .get(index as usize)
+                .is_some_and(|emotion| self.editor.emotion() == *emotion),
+        }
+    }
+
+    pub fn activate_option(&mut self, option: OverlayOption) -> bool {
+        if !option.valid_for(self.editor.tool()) {
+            return false;
+        }
+        match option {
+            OverlayOption::StrokeWidth(index) => {
+                let mut stroke = self.editor.stroke();
+                stroke.width = STROKE_WIDTHS[index as usize];
+                self.editor.set_stroke(stroke)
+            }
+            OverlayOption::TextSize(index) => {
+                let mut style = self.editor.text_style().clone();
+                style.size = TEXT_SIZES[index as usize];
+                self.editor.set_text_style(style)
+            }
+            OverlayOption::ToggleFill => {
+                let stroke = self.editor.stroke();
+                self.editor.set_fill(
+                    stroke
+                        .fill
+                        .map_or(Some(stroke.color.with_alpha(82)), |_| None),
+                )
+            }
+            OverlayOption::Color(index) => {
+                let color = TOOLBAR_COLORS[index as usize];
+                let mut stroke = self.editor.stroke();
+                stroke.color = color;
+                if stroke.fill.is_some() {
+                    stroke.fill = Some(color.with_alpha(82));
+                }
+                let stroke_changed = self.editor.set_stroke(stroke);
+                let mut style = self.editor.text_style().clone();
+                style.color = color;
+                self.editor.set_text_style(style) || stroke_changed
+            }
+            OverlayOption::MosaicBlock(index) => self
+                .editor
+                .set_mosaic_block_size(MOSAIC_BLOCK_SIZES[index as usize]),
+            OverlayOption::Emotion(index) => self.editor.insert_emotion(
+                self.view.document_bounds().center(),
+                EMOTIONS[index as usize],
+            ),
+        }
+    }
+
     pub fn pointer_down(&mut self, point: Point) -> bool {
-        match self.mode {
+        let cursor_changed = self.cursor.replace(point) != Some(point);
+        let changed = match self.mode {
             PreviewMode::Pan => {
                 self.pan_anchor = Some(point);
                 true
@@ -296,14 +389,16 @@ impl PreviewSession {
                 let document = self.view.canvas_to_document(point);
                 self.editor.press(document, self.view.document_bounds())
             }
-        }
+        };
+        changed || cursor_changed
     }
 
     pub fn pointer_move(&mut self, point: Point) -> bool {
-        match self.mode {
+        let cursor_changed = self.cursor.replace(point) != Some(point);
+        let changed = match self.mode {
             PreviewMode::Pan => {
                 let Some(previous) = self.pan_anchor.replace(point) else {
-                    return false;
+                    return cursor_changed;
                 };
                 self.view.pan_by(point - previous)
             }
@@ -312,10 +407,12 @@ impl PreviewSession {
                 self.editor
                     .pointer_move(document, self.view.document_bounds())
             }
-        }
+        };
+        changed || cursor_changed
     }
 
     pub fn double_click(&mut self, point: Point) -> bool {
+        self.cursor = Some(point);
         if self.mode != PreviewMode::Edit {
             return false;
         }
@@ -443,6 +540,25 @@ mod tests {
     }
 
     #[test]
+    fn preview_cursor_follows_tool_text_editing_and_pan_state() {
+        let mut preview = session(800, 600);
+        preview.set_canvas_size(800.0, 600.0);
+        preview.set_tool(Tool::Text);
+        assert!(preview.pointer_move(Point::new(100.0, 100.0)));
+        assert_eq!(preview.pointer_cursor(), PointerCursor::IBeam);
+
+        preview.set_tool(Tool::Mosaic);
+        assert_eq!(preview.pointer_cursor(), PointerCursor::Hidden);
+
+        preview.set_pan_mode();
+        assert_eq!(preview.pointer_cursor(), PointerCursor::Grab);
+        preview.pointer_down(Point::new(100.0, 100.0));
+        assert_eq!(preview.pointer_cursor(), PointerCursor::Grabbing);
+        preview.pointer_up();
+        assert_eq!(preview.pointer_cursor(), PointerCursor::Grab);
+    }
+
+    #[test]
     fn edit_input_is_mapped_back_to_document_pixels_after_zoom_and_rotation() {
         let mut preview = session(400, 200);
         preview.set_canvas_size(800.0, 600.0);
@@ -476,5 +592,38 @@ mod tests {
             .document_to_canvas(Point::new(document.x + 3.0, document.y + 3.0));
         assert!(preview.double_click(canvas));
         assert!(preview.editor().caret().is_some());
+    }
+
+    #[test]
+    fn preview_context_options_reuse_capture_toolbar_values() {
+        let mut preview = session(400, 200);
+        preview.set_tool(Tool::Rectangle);
+        assert!(preview.activate_option(OverlayOption::StrokeWidth(2)));
+        assert!(preview.activate_option(OverlayOption::ToggleFill));
+        assert!(preview.activate_option(OverlayOption::Color(5)));
+        assert!(preview.option_active(OverlayOption::StrokeWidth(2)));
+        assert!(preview.option_active(OverlayOption::ToggleFill));
+        assert!(preview.option_active(OverlayOption::Color(5)));
+
+        preview.set_tool(Tool::Text);
+        assert!(preview.activate_option(OverlayOption::TextSize(0)));
+        assert!(preview.option_active(OverlayOption::TextSize(0)));
+
+        preview.set_tool(Tool::Mosaic);
+        assert!(preview.activate_option(OverlayOption::MosaicBlock(2)));
+        assert!(preview.option_active(OverlayOption::MosaicBlock(2)));
+    }
+
+    #[test]
+    fn choosing_an_emotion_inserts_it_at_the_document_center() {
+        let mut preview = session(400, 200);
+        preview.set_tool(Tool::Emotion);
+        assert!(preview.activate_option(OverlayOption::Emotion(10)));
+        assert!(preview.option_active(OverlayOption::Emotion(10)));
+        assert_eq!(preview.editor().annotations().items().len(), 1);
+        assert_eq!(
+            preview.editor().annotations().items()[0].bounds().center(),
+            Point::new(200.0, 100.0)
+        );
     }
 }

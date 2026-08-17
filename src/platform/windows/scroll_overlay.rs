@@ -11,21 +11,23 @@ use windows_sys::Win32::Graphics::Gdi::{
     RGN_DIFF, SetWindowRgn, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
     GetWindowLongPtrW, IDC_ARROW, IDC_HAND, IsWindow, LoadCursorW, RegisterClassExW, SW_HIDE,
-    SW_SHOW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR,
-    WM_SIZE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SW_SHOWNOACTIVATE, SetCursor, SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_SETCURSOR, WM_SIZE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
-use crate::model::{DesktopFrame, Point, Rect, RectI, ScrollAction, ScrollLayout};
+use crate::model::{DesktopFrame, Point, PointI, Rect, RectI, ScrollAction, ScrollLayout};
 use crate::rendering::OverlayRenderer;
 
-use super::{capture_exclusion, scroll_capture, wgl};
+use super::{capture_exclusion, dpi_scale_at, scroll_capture, wgl};
 
 const CLASS_NAME: &[u16] = &[
     'P' as u16, 'a' as u16, 't' as u16, 'r' as u16, 'i' as u16, 'c' as u16, 'k' as u16, 'S' as u16,
@@ -34,14 +36,18 @@ const CLASS_NAME: &[u16] = &[
     'y' as u16, 0,
 ];
 
-pub(super) fn open(background: &DesktopFrame, selection: RectI) -> Result<Box<Window>> {
+pub(super) fn open(
+    background: &DesktopFrame,
+    selection: RectI,
+    preview: RectI,
+) -> Result<Box<Window>> {
     register_class()?;
     let bounds = background.bounds;
     let instance = unsafe { GetModuleHandleW(null()) };
     let title = wide("Patrick Star Scroll Overlay");
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             CLASS_NAME.as_ptr(),
             title.as_ptr(),
             WS_POPUP,
@@ -63,10 +69,16 @@ pub(super) fn open(background: &DesktopFrame, selection: RectI) -> Result<Box<Wi
         selection.width(),
         selection.height(),
     );
-    if let Err(error) = apply_hole(
+    let local_preview = RectI::new(
+        preview.left.saturating_sub(bounds.left),
+        preview.top.saturating_sub(bounds.top),
+        preview.width(),
+        preview.height(),
+    );
+    if let Err(error) = apply_holes(
         hwnd,
         RectI::new(0, 0, bounds.width(), bounds.height()),
-        local_selection,
+        &[local_selection, local_preview],
     ) {
         unsafe { DestroyWindow(hwnd) };
         return Err(error).context("cut selected region out of scroll overlay");
@@ -94,6 +106,14 @@ pub(super) fn open(background: &DesktopFrame, selection: RectI) -> Result<Box<Wi
     for font in super::ui_font_paths() {
         renderer.load_font(&font);
     }
+    let selection_center = PointI::new(
+        selection
+            .left
+            .saturating_add((selection.width() / 2).min(i32::MAX as u32) as i32),
+        selection
+            .top
+            .saturating_add((selection.height() / 2).min(i32::MAX as u32) as i32),
+    );
     let mut window = Box::new(Window {
         hwnd,
         renderer: Some(renderer),
@@ -106,6 +126,7 @@ pub(super) fn open(background: &DesktopFrame, selection: RectI) -> Result<Box<Wi
         ),
         width: bounds.width(),
         height: bounds.height(),
+        dpi_scale: dpi_scale_at(selection_center, window_dpi_scale(hwnd)),
         hovered: None,
         pressed: None,
         visible: false,
@@ -113,8 +134,7 @@ pub(super) fn open(background: &DesktopFrame, selection: RectI) -> Result<Box<Wi
     });
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *window as *mut Window) as isize);
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         UpdateWindow(hwnd);
     }
     window.visible = true;
@@ -128,6 +148,7 @@ pub(super) struct Window {
     selection: Rect,
     width: u32,
     height: u32,
+    dpi_scale: f32,
     hovered: Option<ScrollAction>,
     pressed: Option<ScrollAction>,
     visible: bool,
@@ -140,7 +161,8 @@ impl Window {
     }
 
     fn action_at(&self, point: Point) -> Option<ScrollAction> {
-        ScrollLayout::new(self.selection, self.surface_bounds()).action_at(point)
+        ScrollLayout::new_scaled(self.selection, self.surface_bounds(), self.dpi_scale)
+            .action_at(point)
     }
 
     fn invalidate(&self) {
@@ -162,6 +184,7 @@ impl Window {
             self.selection,
             self.hovered,
             self.pressed,
+            self.dpi_scale,
         );
         if let Err(error) = surface.present() {
             self.error = Some(error.context("present scroll overlay"));
@@ -278,6 +301,12 @@ unsafe extern "system" fn window_proc(
             state.invalidate();
             0
         }
+        WM_DPICHANGED => {
+            let dpi = (wparam as u32 & 0xffff).max(96);
+            state.dpi_scale = dpi as f32 / 96.0;
+            state.invalidate();
+            0
+        }
         WM_CLOSE => {
             scroll_capture::request(ScrollAction::Cancel);
             0
@@ -287,23 +316,28 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn apply_hole(hwnd: HWND, client: RectI, hole: RectI) -> Result<()> {
+fn window_dpi_scale(hwnd: HWND) -> f32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    dpi as f32 / 96.0
+}
+
+fn apply_holes(hwnd: HWND, client: RectI, holes: &[RectI]) -> Result<()> {
     let outer = unsafe { CreateRectRgn(client.left, client.top, client.right(), client.bottom()) };
-    let excluded = unsafe { CreateRectRgn(hole.left, hole.top, hole.right(), hole.bottom()) };
-    if outer.is_null() || excluded.is_null() {
-        if !outer.is_null() {
-            unsafe { DeleteObject(outer) };
-        }
-        if !excluded.is_null() {
-            unsafe { DeleteObject(excluded) };
-        }
+    if outer.is_null() {
         anyhow::bail!("CreateRectRgn failed for scroll overlay");
     }
-    let combined = unsafe { CombineRgn(outer, outer, excluded, RGN_DIFF) };
-    unsafe { DeleteObject(excluded) };
-    if combined == 0 {
-        unsafe { DeleteObject(outer) };
-        anyhow::bail!("CombineRgn failed for scroll overlay");
+    for hole in holes {
+        let excluded = unsafe { CreateRectRgn(hole.left, hole.top, hole.right(), hole.bottom()) };
+        if excluded.is_null() {
+            unsafe { DeleteObject(outer) };
+            anyhow::bail!("CreateRectRgn failed for scroll overlay hole");
+        }
+        let combined = unsafe { CombineRgn(outer, outer, excluded, RGN_DIFF) };
+        unsafe { DeleteObject(excluded) };
+        if combined == 0 {
+            unsafe { DeleteObject(outer) };
+            anyhow::bail!("CombineRgn failed for scroll overlay");
+        }
     }
     if unsafe { SetWindowRgn(hwnd, outer, 1) } == 0 {
         unsafe { DeleteObject(outer) };

@@ -43,9 +43,7 @@ impl Surface {
     }
 
     pub fn ensure_current(&self) -> Result<()> {
-        if unsafe { wglGetCurrentContext() } == self.context
-            && unsafe { wglGetCurrentDC() } == self.dc
-        {
+        if self.is_current() {
             return Ok(());
         }
         anyhow::ensure!(
@@ -53,6 +51,11 @@ impl Surface {
             "wglMakeCurrent failed"
         );
         Ok(())
+    }
+
+    pub fn is_current(&self) -> bool {
+        (unsafe { wglGetCurrentContext() }) == self.context
+            && (unsafe { wglGetCurrentDC() }) == self.dc
     }
 
     pub fn present(&self) -> Result<()> {

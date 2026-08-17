@@ -18,7 +18,7 @@ pub use annotation::{
 };
 pub use capture::{DetectedTarget, OverlayFeatures, OverlaySession, TargetKind};
 pub use color::{ANNOTATION_COLORS, Rgba};
-pub use cursor::{PointerCursor, capture_cursor};
+pub use cursor::{PointerCursor, capture_cursor, preview_cursor};
 pub use editor::{Editor, EditorKey};
 pub use export::{CaptureIntent, ExportRegion, RgbaFrame};
 pub use frame::DesktopFrame;

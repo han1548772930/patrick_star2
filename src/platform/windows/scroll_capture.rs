@@ -1,31 +1,31 @@
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Instant;
 
-use anyhow::{Result, anyhow};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use anyhow::{Context, Result, anyhow};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_RETURN, VK_SHIFT,
-    VK_XBUTTON1, VK_XBUTTON2,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HC_ACTION,
-    HHOOK, HWND_MESSAGE, KillTimer, MSG, PostMessageW, SetTimer, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN,
-    WM_MOUSEWHEEL, WM_SYSKEYDOWN, WM_TIMER, WindowFromPoint,
+    HHOOK, HWND_MESSAGE, MSG, PostMessageW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_MOUSEWHEEL,
+    WM_SYSKEYDOWN,
 };
 
 use crate::model::{PointI, RectI, ScrollAction};
-use crate::platform::{ActiveScrollCapture, ScrollCaptureEvent, ScrollCaptureIntent};
+use crate::platform::{
+    ActiveScrollCapture, CapturedScrollFrame, ScrollCaptureEvent, ScrollCaptureIntent,
+    ScrollDirection,
+};
 
 use super::capture::RegionCapture;
 
-const MESSAGE_WHEEL: u32 = WM_APP + 1;
+const MESSAGE_FRAME: u32 = WM_APP + 1;
 const MESSAGE_FINISH: u32 = WM_APP + 2;
 const MESSAGE_CANCEL: u32 = WM_APP + 3;
-const CAPTURE_TIMER: usize = 1;
-const CAPTURE_SETTLE_MS: u32 = 80;
 const FINISH_EDIT: WPARAM = 1;
 const FINISH_SAVE: WPARAM = 2;
 const FINISH_CLIPBOARD: WPARAM = 3;
@@ -35,17 +35,46 @@ static ACTIVE_LEFT: AtomicI32 = AtomicI32::new(0);
 static ACTIVE_TOP: AtomicI32 = AtomicI32::new(0);
 static ACTIVE_RIGHT: AtomicI32 = AtomicI32::new(0);
 static ACTIVE_BOTTOM: AtomicI32 = AtomicI32::new(0);
+static WHEEL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WHEEL_DIRECTION: AtomicI8 = AtomicI8::new(0);
 
-const MK_LBUTTON: u32 = 0x0001;
-const MK_RBUTTON: u32 = 0x0002;
-const MK_SHIFT: u32 = 0x0004;
-const MK_CONTROL: u32 = 0x0008;
-const MK_MBUTTON: u32 = 0x0010;
-const MK_XBUTTON1: u32 = 0x0020;
-const MK_XBUTTON2: u32 = 0x0040;
+type FrameResult = std::result::Result<CapturedScrollFrame, String>;
+
+struct LatestFrameSlot {
+    frame: Mutex<Option<FrameResult>>,
+    closed: AtomicBool,
+}
+
+impl LatestFrameSlot {
+    fn new() -> Self {
+        Self {
+            frame: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn replace(&self, frame: FrameResult) -> std::result::Result<(), ()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let mut slot = self.frame.lock().map_err(|_| ())?;
+        *slot = Some(frame);
+        Ok(())
+    }
+
+    fn take(&self) -> Option<FrameResult> {
+        self.frame.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut slot) = self.frame.lock() {
+            *slot = None;
+        }
+    }
+}
 
 pub fn start(bounds: RectI) -> Result<Box<dyn ActiveScrollCapture>> {
-    let capture = RegionCapture::new(bounds)?;
     let class_name = wide("STATIC");
     let window_name = wide("Patrick Star Scroll Capture");
     let hwnd = unsafe {
@@ -76,31 +105,98 @@ pub fn start(bounds: RectI) -> Result<Box<dyn ActiveScrollCapture>> {
         anyhow::bail!("a scroll capture session is already active");
     }
     set_active_bounds(bounds);
+    WHEEL_DIRECTION.store(0, Ordering::Release);
 
     let module = unsafe { GetModuleHandleW(null()) };
     let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0) };
     if mouse_hook.is_null() {
-        ACTIVE_WINDOW.store(null_mut(), Ordering::Release);
-        clear_active_bounds();
-        unsafe { DestroyWindow(hwnd) };
+        cleanup_failed_start(hwnd, null_mut(), null_mut());
         anyhow::bail!("install scroll mouse hook failed");
     }
     let keyboard_hook =
         unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) };
     if keyboard_hook.is_null() {
-        unsafe { UnhookWindowsHookEx(mouse_hook) };
-        ACTIVE_WINDOW.store(null_mut(), Ordering::Release);
-        clear_active_bounds();
-        unsafe { DestroyWindow(hwnd) };
+        cleanup_failed_start(hwnd, mouse_hook, null_mut());
         anyhow::bail!("install scroll keyboard hook failed");
+    }
+
+    let frames = Arc::new(LatestFrameSlot::new());
+    let notified = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_frames = frames.clone();
+    let worker_notified = notified.clone();
+    let worker_stop = stop.clone();
+    let worker_hwnd = hwnd as usize;
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let grab_thread = match std::thread::Builder::new()
+        .name("scroll-capture-grab".to_owned())
+        .spawn(move || {
+            let mut capture = match RegionCapture::new(bounds) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            if ready_tx.send(Ok(())).is_err() {
+                return;
+            }
+            let hwnd = worker_hwnd as HWND;
+            while !worker_stop.load(Ordering::Acquire) {
+                let captured_at = Instant::now();
+                let result = capture.capture_rgba().map(|frame| CapturedScrollFrame {
+                    frame,
+                    captured_at,
+                    direction: current_direction(),
+                    wheel_sequence: WHEEL_SEQUENCE.load(Ordering::Acquire),
+                    native_scroll_position: None,
+                    discontinuity: false,
+                });
+                if worker_frames
+                    .replace(result.map_err(|error| error.to_string()))
+                    .is_err()
+                {
+                    break;
+                }
+                if !worker_notified.swap(true, Ordering::AcqRel)
+                    && unsafe { PostMessageW(hwnd, MESSAGE_FRAME, 0, 0) } == 0
+                {
+                    break;
+                }
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            cleanup_failed_start(hwnd, mouse_hook, keyboard_hook);
+            return Err(error).context("spawn scroll capture grab worker");
+        }
+    };
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            stop.store(true, Ordering::Release);
+            frames.close();
+            let _ = grab_thread.join();
+            cleanup_failed_start(hwnd, mouse_hook, keyboard_hook);
+            anyhow::bail!(error);
+        }
+        Err(_) => {
+            stop.store(true, Ordering::Release);
+            frames.close();
+            let _ = grab_thread.join();
+            cleanup_failed_start(hwnd, mouse_hook, keyboard_hook);
+            anyhow::bail!("scroll capture grab worker stopped during startup");
+        }
     }
 
     Ok(Box::new(WindowsScrollCapture {
         hwnd,
         mouse_hook,
         keyboard_hook,
-        bounds,
-        capture,
+        frames,
+        notified,
+        stop,
+        grab_thread: Some(grab_thread),
     }))
 }
 
@@ -129,8 +225,10 @@ struct WindowsScrollCapture {
     hwnd: HWND,
     mouse_hook: HHOOK,
     keyboard_hook: HHOOK,
-    bounds: RectI,
-    capture: RegionCapture,
+    frames: Arc<LatestFrameSlot>,
+    notified: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    grab_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ActiveScrollCapture for WindowsScrollCapture {
@@ -147,22 +245,13 @@ impl ActiveScrollCapture for WindowsScrollCapture {
 
             if message.hwnd == self.hwnd {
                 match message.message {
-                    MESSAGE_WHEEL => {
-                        let point = PointI::new(message.wParam as i32, message.lParam as i32);
-                        if !self.bounds.contains(point) {
-                            continue;
+                    MESSAGE_FRAME => {
+                        self.notified.store(false, Ordering::Release);
+                        match self.frames.take() {
+                            Some(Ok(frame)) => return Ok(ScrollCaptureEvent::Frame(frame)),
+                            Some(Err(error)) => return Err(anyhow!(error)),
+                            None => continue,
                         }
-                        unsafe { KillTimer(self.hwnd, CAPTURE_TIMER) };
-                        anyhow::ensure!(
-                            unsafe { SetTimer(self.hwnd, CAPTURE_TIMER, CAPTURE_SETTLE_MS, None) }
-                                != 0,
-                            "schedule scroll frame capture failed"
-                        );
-                        continue;
-                    }
-                    WM_TIMER if message.wParam == CAPTURE_TIMER => {
-                        unsafe { KillTimer(self.hwnd, CAPTURE_TIMER) };
-                        return Ok(ScrollCaptureEvent::Frame(self.capture.capture_rgba()?));
                     }
                     MESSAGE_FINISH => {
                         let intent = match message.wParam {
@@ -188,8 +277,12 @@ impl ActiveScrollCapture for WindowsScrollCapture {
 
 impl Drop for WindowsScrollCapture {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.frames.close();
+        if let Some(thread) = self.grab_thread.take() {
+            let _ = thread.join();
+        }
         unsafe {
-            KillTimer(self.hwnd, CAPTURE_TIMER);
             UnhookWindowsHookEx(self.keyboard_hook);
             UnhookWindowsHookEx(self.mouse_hook);
         }
@@ -215,10 +308,10 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         };
         let point = PointI::new(mouse.pt.x, mouse.pt.y);
         if active_bounds_contain(point) {
-            let forwarded = unsafe { forward_wheel(point, mouse.mouseData) };
-            post_active(MESSAGE_WHEEL, point.x as usize, point.y as isize);
-            if forwarded {
-                return 1;
+            let delta = (mouse.mouseData >> 16) as u16 as i16;
+            if delta != 0 {
+                WHEEL_DIRECTION.store(if delta < 0 { 1 } else { -1 }, Ordering::Release);
+                WHEEL_SEQUENCE.fetch_add(1, Ordering::AcqRel);
             }
         }
     }
@@ -243,6 +336,28 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         }
     }
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+}
+
+fn current_direction() -> ScrollDirection {
+    match WHEEL_DIRECTION.load(Ordering::Acquire) {
+        value if value < 0 => ScrollDirection::Up,
+        value if value > 0 => ScrollDirection::Down,
+        _ => ScrollDirection::Unknown,
+    }
+}
+
+fn cleanup_failed_start(hwnd: HWND, mouse_hook: HHOOK, keyboard_hook: HHOOK) {
+    unsafe {
+        if !keyboard_hook.is_null() {
+            UnhookWindowsHookEx(keyboard_hook);
+        }
+        if !mouse_hook.is_null() {
+            UnhookWindowsHookEx(mouse_hook);
+        }
+    }
+    ACTIVE_WINDOW.store(null_mut(), Ordering::Release);
+    clear_active_bounds();
+    unsafe { DestroyWindow(hwnd) };
 }
 
 fn post_active(message: u32, wparam: WPARAM, lparam: LPARAM) {
@@ -274,57 +389,6 @@ fn active_bounds_contain(point: PointI) -> bool {
     point.x >= left && point.x < right && point.y >= top && point.y < bottom
 }
 
-unsafe fn forward_wheel(point: PointI, mouse_data: u32) -> bool {
-    let target = unsafe {
-        WindowFromPoint(POINT {
-            x: point.x,
-            y: point.y,
-        })
-    };
-    if target.is_null() {
-        return false;
-    }
-    let key_state = wheel_key_state();
-    unsafe {
-        PostMessageW(
-            target,
-            WM_MOUSEWHEEL,
-            compose_wheel_wparam(mouse_data, key_state),
-            pack_screen_point(point),
-        ) != 0
-    }
-}
-
-fn wheel_key_state() -> u32 {
-    [
-        (VK_LBUTTON, MK_LBUTTON),
-        (VK_RBUTTON, MK_RBUTTON),
-        (VK_SHIFT, MK_SHIFT),
-        (VK_CONTROL, MK_CONTROL),
-        (VK_MBUTTON, MK_MBUTTON),
-        (VK_XBUTTON1, MK_XBUTTON1),
-        (VK_XBUTTON2, MK_XBUTTON2),
-    ]
-    .into_iter()
-    .fold(0, |state, (key, flag)| {
-        if unsafe { GetKeyState(key as i32) } < 0 {
-            state | flag
-        } else {
-            state
-        }
-    })
-}
-
-fn compose_wheel_wparam(mouse_data: u32, key_state: u32) -> WPARAM {
-    ((mouse_data & 0xffff_0000) | (key_state & 0x0000_ffff)) as WPARAM
-}
-
-fn pack_screen_point(point: PointI) -> LPARAM {
-    let x = point.x as i16 as u16 as u32;
-    let y = point.y as i16 as u16 as u32;
-    (x | (y << 16)) as LPARAM
-}
-
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -333,18 +397,27 @@ fn wide(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn wheel_message_preserves_signed_delta_and_modifier_bits() {
-        assert_eq!(
-            compose_wheel_wparam(0xff88_0000, MK_CONTROL | MK_SHIFT),
-            0xff88_000c
-        );
+    fn captured(seed: u8) -> CapturedScrollFrame {
+        CapturedScrollFrame {
+            frame: crate::model::RgbaFrame::new(
+                RectI::new(0, 0, 1, 1),
+                vec![seed, seed, seed, 255],
+            )
+            .unwrap(),
+            captured_at: Instant::now(),
+            direction: ScrollDirection::Unknown,
+            wheel_sequence: 0,
+            native_scroll_position: None,
+            discontinuity: false,
+        }
     }
 
     #[test]
-    fn wheel_message_packs_negative_virtual_desktop_coordinates() {
-        let packed = pack_screen_point(PointI::new(-1920, -240)) as u32;
-        assert_eq!(packed as u16 as i16 as i32, -1920);
-        assert_eq!((packed >> 16) as u16 as i16 as i32, -240);
+    fn latest_frame_slot_overwrites_an_unconsumed_frame() {
+        let slot = LatestFrameSlot::new();
+        slot.replace(Ok(captured(1))).unwrap();
+        slot.replace(Ok(captured(2))).unwrap();
+        assert_eq!(slot.take().unwrap().unwrap().frame.pixels()[0], 2);
+        assert!(slot.take().is_none());
     }
 }

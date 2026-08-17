@@ -8,17 +8,18 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use std::time::Duration;
 
 use crate::model::{CaptureIntent, CaptureOutcome, DesktopFrame, OverlayFeatures, RgbaFrame};
 use crate::ocr::TextRecognizer;
 use crate::platform::{
-    Availability, CaptureOverlayHandoff, CaptureOverlayResult, DirectoryPicker,
-    GlobalShortcutHost, GlobalShortcutRegistration, ImageClipboard, ImageSaveDialog,
-    PlatformBackend, PlatformCapabilities, ScrollCaptureEvent, ScrollCaptureIntent,
-    ScrollCaptureSource, Shortcut, SingleInstanceHost, TextClipboard,
+    Availability, CaptureOverlayHandoff, CaptureOverlayResult, DirectoryPicker, GlobalShortcutHost,
+    GlobalShortcutRegistration, ImageClipboard, ImageSaveDialog, PlatformBackend,
+    PlatformCapabilities, ScrollCaptureEvent, ScrollCaptureIntent, ScrollCaptureSource, Shortcut,
+    SingleInstanceHost, TextClipboard,
 };
 #[cfg(feature = "opencv-orb")]
-use crate::scroll::{OpenCvOrbMatcher, PushOutcome, ScrollConfig, ScrollSession};
+use crate::scroll::{ScrollCaptureWorker, ScrollWorkerEvent};
 use crate::settings::{Settings, SettingsStore};
 use crate::ui::{AppTray, OcrLanguageChoice, SettingsDialog};
 use anyhow::Context;
@@ -95,16 +96,27 @@ pub fn run() -> anyhow::Result<()> {
     let settings_dialog = Rc::new(RefCell::new(None));
     let dialog_slot = settings_dialog.clone();
     tray.on_settings(move || {
-        if let Err(error) = show_settings(
-            dialog_slot.clone(),
-            dialog_settings.clone(),
-            dialog_store.clone(),
-            dialog_host.clone(),
-            dialog_registration.clone(),
-            dialog_capture.clone(),
-        ) {
-            eprintln!("open settings failed: {error:#}");
-        }
+        let dialog_slot = dialog_slot.clone();
+        let dialog_settings = dialog_settings.clone();
+        let dialog_store = dialog_store.clone();
+        let dialog_host = dialog_host.clone();
+        let dialog_registration = dialog_registration.clone();
+        let dialog_capture = dialog_capture.clone();
+        // The native tray backend invokes this callback from its window
+        // procedure while its menu state is still borrowed. Create the Slint
+        // window on the next UI-loop turn to avoid re-entering that callback.
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Err(error) = show_settings(
+                dialog_slot,
+                dialog_settings,
+                dialog_store,
+                dialog_host,
+                dialog_registration,
+                dialog_capture,
+            ) {
+                eprintln!("open settings failed: {error:#}");
+            }
+        });
     });
 
     tray.show()?;
@@ -123,8 +135,7 @@ fn capture_once(
     );
     let frame = backend.capture_virtual_desktop()?;
     let features = overlay_features(capabilities);
-    let CaptureOverlayResult { outcome, handoff } =
-        backend.run_capture_overlay(frame, features)?;
+    let CaptureOverlayResult { outcome, handoff } = backend.run_capture_overlay(frame, features)?;
     let CaptureOutcome::Confirmed {
         image,
         intent,
@@ -472,23 +483,26 @@ fn run_scroll_capture(
     let mut capture = backend.start_scroll_capture(initial.bounds())?;
     let mut preview = backend.open_scroll_preview(desktop, &initial)?;
     ready()?;
-    let matcher = OpenCvOrbMatcher::new(1_200)?;
-    let mut session = ScrollSession::new(initial, matcher, ScrollConfig::default());
+    let worker = ScrollCaptureWorker::new(initial)?;
     loop {
         match capture.next_event()? {
-            ScrollCaptureEvent::Frame(frame) => match session.push(frame)? {
-                PushOutcome::Appended { preview: dirty, .. } => {
-                    let patch = session
-                        .document()
-                        .preview_patch(dirty)
-                        .expect("scroll session returned a valid preview region");
-                    preview.update(patch)?;
+            ScrollCaptureEvent::Frame(frame) => {
+                let _ = worker.push_frame(frame)?;
+                while let Some(event) = worker.poll_event() {
+                    match event {
+                        ScrollWorkerEvent::Preview(patch) => {
+                            preview.update(patch.as_patch())?;
+                        }
+                        ScrollWorkerEvent::FrameProcessed => {}
+                        ScrollWorkerEvent::FrameDiscarded(error) => {
+                            eprintln!("scroll frame discarded: {error}");
+                        }
+                    }
                 }
-                PushOutcome::Duplicate | PushOutcome::Rejected(_) => {}
-            },
+            }
             ScrollCaptureEvent::Finished(intent) => {
                 return Ok(Some(ScrollCaptureOutput {
-                    image: session.finish(),
+                    image: worker.finish()?,
                     intent,
                 }));
             }
@@ -526,6 +540,7 @@ mod tests {
             global_shortcut: value,
             tray: value,
             capture_exclusion: value,
+            window_frame: value,
         }
     }
 

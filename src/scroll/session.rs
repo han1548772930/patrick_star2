@@ -1,247 +1,247 @@
-use crate::model::RgbaFrame;
+use anyhow::Result;
 
-use super::{FrameFingerprint, PreviewRegion, StitchDocument};
+use crate::model::{RectI, RgbaFrame};
+use crate::platform::{CapturedScrollFrame, ScrollDirection};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Alignment {
-    /// Previous keypoint x minus current keypoint x.
-    pub horizontal_shift: f32,
-    /// Previous keypoint y minus current keypoint y. Positive means scrolling down.
-    pub vertical_shift: f32,
-    pub good_matches: u32,
-    pub inliers: u32,
-}
+use super::orb::match_frames;
+use super::{OwnedPreviewPatch, TiledImage};
 
-impl Alignment {
-    pub fn inlier_ratio(self) -> f32 {
-        if self.good_matches == 0 {
-            0.0
-        } else {
-            self.inliers as f32 / self.good_matches as f32
-        }
-    }
-}
+const MAX_STITCHED_HEIGHT: u32 = 30_000;
+const MAX_STITCHED_AREA: u64 = 149_999_999;
 
-pub trait FrameMatcher {
-    fn align(&mut self, previous: &RgbaFrame, current: &RgbaFrame) -> anyhow::Result<Alignment>;
-
-    /// Commits any cached features for the current frame after it was stitched.
-    fn accept_alignment(&mut self) {}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ScrollConfig {
-    pub duplicate_luma_difference: f32,
-    pub minimum_vertical_shift: f32,
-    pub maximum_vertical_shift_ratio: f32,
-    pub maximum_horizontal_shift: f32,
-    pub minimum_good_matches: u32,
-    pub minimum_inlier_ratio: f32,
-}
-
-impl Default for ScrollConfig {
-    fn default() -> Self {
-        Self {
-            duplicate_luma_difference: 0.75,
-            minimum_vertical_shift: 4.0,
-            maximum_vertical_shift_ratio: 0.9,
-            maximum_horizontal_shift: 8.0,
-            minimum_good_matches: 12,
-            minimum_inlier_ratio: 0.55,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RejectReason {
-    DimensionsChanged,
-    NotEnoughMatches,
-    LowInlierRatio,
-    HorizontalDrift,
-    UnsupportedDirection,
-    ShiftOutsideViewport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PushOutcome {
-    Duplicate,
-    Rejected(RejectReason),
-    Appended {
-        alignment: Alignment,
-        preview: PreviewRegion,
-    },
-}
-
-pub struct ScrollSession<M> {
-    config: ScrollConfig,
-    matcher: M,
-    previous_fingerprint: FrameFingerprint,
+#[derive(Clone)]
+pub(crate) struct ScrollCaptureSession {
+    stitched: TiledImage,
     previous: RgbaFrame,
-    document: StitchDocument,
+    bounds: RectI,
+    position: i64,
+    max_depth: i64,
+    planned_height: u32,
 }
 
-impl<M: FrameMatcher> ScrollSession<M> {
-    pub fn new(initial: RgbaFrame, matcher: M, config: ScrollConfig) -> Self {
-        let previous_fingerprint = FrameFingerprint::from_frame(&initial);
-        let document = StitchDocument::from_frame(&initial);
+pub(crate) struct MatchedFrame {
+    pub(crate) splice_id: u64,
+    frame: RgbaFrame,
+    shift: i32,
+    growth: Option<SpliceGrowth>,
+}
+
+#[derive(Clone, Copy)]
+struct SpliceGrowth {
+    rows: u32,
+    from_top: bool,
+}
+
+impl ScrollCaptureSession {
+    pub(crate) fn new(initial: RgbaFrame) -> Self {
+        let bounds = initial.bounds();
         Self {
-            config,
-            matcher,
-            previous_fingerprint,
+            stitched: TiledImage::new(initial.width(), initial.height(), initial.pixels().to_vec()),
             previous: initial,
-            document,
+            bounds,
+            position: 0,
+            max_depth: 0,
+            planned_height: bounds.height(),
         }
     }
 
-    pub fn document(&self) -> &StitchDocument {
-        &self.document
+    pub(crate) fn reset_baseline(&mut self, frame: RgbaFrame) {
+        if frame.width() == self.previous.width() && frame.height() == self.previous.height() {
+            self.previous = frame;
+        }
     }
 
-    pub fn push(&mut self, frame: RgbaFrame) -> anyhow::Result<PushOutcome> {
-        if frame.width() != self.previous.width() || frame.height() != self.previous.height() {
-            return Ok(PushOutcome::Rejected(RejectReason::DimensionsChanged));
+    pub(crate) fn match_frame(
+        &mut self,
+        splice_id: u64,
+        captured: CapturedScrollFrame,
+        direction: ScrollDirection,
+    ) -> Result<Option<MatchedFrame>> {
+        let frame = captured.frame;
+        anyhow::ensure!(
+            frame.width() == self.previous.width() && frame.height() == self.previous.height(),
+            "scroll frame dimensions changed during capture"
+        );
+        if visible_pixels_identical(&self.previous, &frame) {
+            return Ok(None);
         }
-
-        let fingerprint = FrameFingerprint::from_frame(&frame);
-        if self
-            .previous_fingerprint
-            .difference(&fingerprint)
-            .is_some_and(|difference| difference <= self.config.duplicate_luma_difference)
-        {
-            return Ok(PushOutcome::Duplicate);
+        let matched = match_frames(&self.previous, &frame, direction);
+        self.previous = frame.clone();
+        let matched = matched?;
+        if matched.rejected {
+            eprintln!(
+                "scroll frame offset {} exceeds 60% of the viewport and was discarded",
+                matched.raw_shift
+            );
+            return Ok(None);
         }
-
-        let alignment = self.matcher.align(&self.previous, &frame)?;
-        if alignment.good_matches < self.config.minimum_good_matches {
-            return Ok(PushOutcome::Rejected(RejectReason::NotEnoughMatches));
-        }
-        if alignment.inlier_ratio() < self.config.minimum_inlier_ratio {
-            return Ok(PushOutcome::Rejected(RejectReason::LowInlierRatio));
-        }
-        if alignment.horizontal_shift.abs() > self.config.maximum_horizontal_shift {
-            return Ok(PushOutcome::Rejected(RejectReason::HorizontalDrift));
-        }
-        if alignment.vertical_shift < self.config.minimum_vertical_shift {
-            return Ok(PushOutcome::Rejected(RejectReason::UnsupportedDirection));
-        }
-        let maximum_shift = frame.height() as f32 * self.config.maximum_vertical_shift_ratio;
-        if alignment.vertical_shift > maximum_shift {
-            return Ok(PushOutcome::Rejected(RejectReason::ShiftOutsideViewport));
-        }
-
-        let rows = alignment
-            .vertical_shift
-            .round()
-            .clamp(1.0, frame.height() as f32) as u32;
-        let preview = self.document.append_bottom(&frame, rows)?;
-        self.matcher.accept_alignment();
-        self.previous = frame;
-        self.previous_fingerprint = fingerprint;
-        Ok(PushOutcome::Appended { alignment, preview })
+        Ok(Some(MatchedFrame {
+            splice_id,
+            frame,
+            shift: matched.shift,
+            growth: None,
+        }))
     }
 
-    pub fn finish(self) -> RgbaFrame {
-        self.document.into_frame()
+    pub(crate) fn plan_matched_frame(&mut self, matched: &mut MatchedFrame) -> Result<()> {
+        if matched.shift == 0 {
+            return Ok(());
+        }
+        self.position -= matched.shift as i64;
+        let growth = if self.position < 0 {
+            let rows = (-self.position) as u32;
+            self.max_depth += rows as i64;
+            self.position = 0;
+            Some(SpliceGrowth {
+                rows,
+                from_top: true,
+            })
+        } else {
+            let rows = self.position - self.max_depth;
+            if rows > 0 {
+                self.max_depth = self.position;
+                Some(SpliceGrowth {
+                    rows: rows as u32,
+                    from_top: false,
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(growth) = growth {
+            ensure_height_limit(self.stitched.width(), self.planned_height, growth.rows)?;
+            self.planned_height += growth.rows;
+            matched.growth = Some(growth);
+        }
+        Ok(())
     }
+
+    pub(crate) fn commit_matched_frame(
+        &mut self,
+        matched: MatchedFrame,
+    ) -> Result<Option<OwnedPreviewPatch>> {
+        let Some(growth) = matched.growth else {
+            self.previous = matched.frame;
+            return Ok(None);
+        };
+        ensure_height_limit(self.stitched.width(), self.stitched.height(), growth.rows)?;
+        let (strip, strip_height) = crop_splice_strip(&matched.frame, growth.rows, growth.from_top);
+        self.previous = matched.frame;
+        let region = if growth.from_top {
+            self.stitched
+                .prepend_overlapping(strip, strip_height, growth.rows)
+        } else {
+            self.stitched
+                .append_overlapping(strip, strip_height, growth.rows)
+        };
+        Ok(Some(OwnedPreviewPatch {
+            document_width: self.stitched.width(),
+            document_height: self.stitched.height(),
+            rgba: self.stitched.crop_rows(region.top, region.height),
+            region,
+        }))
+    }
+
+    pub(crate) fn finish(self) -> RgbaFrame {
+        let bounds = RectI::new(
+            self.bounds.left,
+            self.bounds.top,
+            self.stitched.width(),
+            self.stitched.height(),
+        );
+        RgbaFrame::new(bounds, self.stitched.into_pixels())
+            .expect("scroll stitcher maintains a valid RGBA document")
+    }
+}
+
+fn visible_pixels_identical(left: &RgbaFrame, right: &RgbaFrame) -> bool {
+    left.pixels().len() == right.pixels().len()
+        && left
+            .pixels()
+            .chunks_exact(4)
+            .zip(right.pixels().chunks_exact(4))
+            .all(|(left, right)| left[..3] == right[..3])
+}
+
+fn crop_splice_strip(frame: &RgbaFrame, grow: u32, from_top: bool) -> (Vec<u8>, u32) {
+    let height = frame.height();
+    let crop = (height / 2)
+        .max(height.div_ceil(4).saturating_add(grow))
+        .clamp(1, height);
+    let top = if from_top { 0 } else { height - crop };
+    let row_bytes = frame.width() as usize * 4;
+    let start = top as usize * row_bytes;
+    let end = start + crop as usize * row_bytes;
+    (frame.pixels()[start..end].to_vec(), crop)
+}
+
+fn ensure_height_limit(width: u32, current_height: u32, added_height: u32) -> Result<()> {
+    let height = current_height.saturating_add(added_height);
+    anyhow::ensure!(
+        height <= MAX_STITCHED_HEIGHT
+            && width <= MAX_STITCHED_HEIGHT
+            && width as u64 * height as u64 <= MAX_STITCHED_AREA,
+        "scrolling screenshot reached the maximum height of {MAX_STITCHED_HEIGHT}px"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-
     use super::*;
-    use crate::model::RectI;
-
-    struct Matcher {
-        results: VecDeque<Alignment>,
-        calls: usize,
-    }
-
-    impl FrameMatcher for Matcher {
-        fn align(
-            &mut self,
-            _previous: &RgbaFrame,
-            _current: &RgbaFrame,
-        ) -> anyhow::Result<Alignment> {
-            self.calls += 1;
-            Ok(self.results.pop_front().unwrap())
-        }
-    }
 
     fn frame(rows: &[u8]) -> RgbaFrame {
         let pixels = rows
             .iter()
             .flat_map(|value| [*value, *value, *value, 255])
             .collect();
-        RgbaFrame::new(RectI::new(20, -10, 1, rows.len() as u32), pixels).unwrap()
+        RgbaFrame::new(RectI::new(0, 0, 1, rows.len() as u32), pixels).unwrap()
     }
 
-    fn alignment(vertical_shift: f32) -> Alignment {
-        Alignment {
-            horizontal_shift: 0.25,
-            vertical_shift,
-            good_matches: 40,
-            inliers: 35,
+    fn matched(id: u64, frame: RgbaFrame, shift: i32) -> MatchedFrame {
+        MatchedFrame {
+            splice_id: id,
+            frame,
+            shift,
+            growth: None,
         }
     }
 
     #[test]
-    fn duplicates_skip_orb_matching() {
-        let matcher = Matcher {
-            results: VecDeque::new(),
-            calls: 0,
-        };
-        let mut session =
-            ScrollSession::new(frame(&[10, 20, 30, 40]), matcher, ScrollConfig::default());
-        assert_eq!(
-            session.push(frame(&[10, 20, 30, 40])).unwrap(),
-            PushOutcome::Duplicate
-        );
-        assert_eq!(session.matcher.calls, 0);
-    }
-
-    #[test]
-    fn accepted_alignment_appends_new_rows() {
-        let matcher = Matcher {
-            results: VecDeque::from([alignment(2.0)]),
-            calls: 0,
-        };
-        let config = ScrollConfig {
-            minimum_vertical_shift: 1.0,
-            ..ScrollConfig::default()
-        };
-        let mut session = ScrollSession::new(frame(&[10, 20, 30, 40]), matcher, config);
-        let outcome = session.push(frame(&[30, 40, 50, 60])).unwrap();
-
-        assert!(matches!(
-            outcome,
-            PushOutcome::Appended {
-                preview: PreviewRegion { top: 4, height: 2 },
-                ..
-            }
-        ));
+    fn scrolling_back_over_captured_rows_does_not_duplicate_them() {
+        let mut session = ScrollCaptureSession::new(frame(&[1, 2, 3, 4]));
+        for (id, shift, rows) in [
+            (1, -2, &[3, 4, 5, 6][..]),
+            (2, 2, &[1, 2, 3, 4][..]),
+            (3, -2, &[3, 4, 5, 6][..]),
+        ] {
+            let mut next = matched(id, frame(rows), shift);
+            session.plan_matched_frame(&mut next).unwrap();
+            session.commit_matched_frame(next).unwrap();
+        }
         assert_eq!(session.finish().height(), 6);
     }
 
     #[test]
-    fn weak_or_drifting_alignment_is_rejected_without_changing_document() {
-        let matcher = Matcher {
-            results: VecDeque::from([Alignment {
-                horizontal_shift: 15.0,
-                ..alignment(2.0)
-            }]),
-            calls: 0,
-        };
-        let config = ScrollConfig {
-            minimum_vertical_shift: 1.0,
-            ..ScrollConfig::default()
-        };
-        let mut session = ScrollSession::new(frame(&[10, 20, 30, 40]), matcher, config);
+    fn scrolling_above_the_first_frame_prepends_new_rows() {
+        let mut session = ScrollCaptureSession::new(frame(&[3, 4, 5, 6]));
+        let mut next = matched(1, frame(&[1, 2, 3, 4]), 2);
+        session.plan_matched_frame(&mut next).unwrap();
+        session.commit_matched_frame(next).unwrap();
+        let output = session.finish();
+        let rows = output
+            .pixels()
+            .chunks_exact(4)
+            .map(|pixel| pixel[0])
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [1, 2, 3, 4, 5, 6]);
+    }
 
-        assert_eq!(
-            session.push(frame(&[30, 40, 50, 60])).unwrap(),
-            PushOutcome::Rejected(RejectReason::HorizontalDrift)
-        );
-        assert_eq!(session.document().height(), 4);
+    #[test]
+    fn discontinuity_can_replace_the_matcher_baseline_without_growing() {
+        let mut session = ScrollCaptureSession::new(frame(&[1, 2, 3, 4]));
+        let replacement = frame(&[9, 8, 7, 6]);
+        session.reset_baseline(replacement.clone());
+        assert!(visible_pixels_identical(&session.previous, &replacement));
     }
 }

@@ -1,194 +1,240 @@
-use anyhow::Context;
-use opencv::core::{DMatch, KeyPoint, Mat, NORM_HAMMING, Ptr, Vector};
-use opencv::features2d::{
-    BFMatcher, DescriptorMatcherTraitConst, Feature2DTrait, ORB, ORB_ScoreType,
-};
-use opencv::imgproc::{COLOR_RGBA2GRAY, cvt_color_def};
-use opencv::prelude::{KeyPointTraitConst, MatTraitConst};
+use std::collections::BTreeMap;
+
+use anyhow::{Context, Result};
+use opencv::core::{self, DMatch, Mat};
+use opencv::features2d;
+use opencv::prelude::*;
 
 use crate::model::RgbaFrame;
+use crate::platform::ScrollDirection;
 
-use super::{Alignment, FrameMatcher};
+const SUPPORT_WEIGHT: usize = 20;
 
-const LOWE_RATIO: f32 = 0.75;
-const MINIMUM_INLIER_TOLERANCE: f32 = 2.0;
-const MAXIMUM_INLIER_TOLERANCE: f32 = 8.0;
-
-pub struct OpenCvOrbMatcher {
-    orb: Ptr<ORB>,
-    matcher: Ptr<BFMatcher>,
-    accepted: Option<Features>,
-    candidate: Option<Features>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameMatch {
+    pub(crate) shift: i32,
+    pub(crate) raw_shift: i32,
+    pub(crate) rejected: bool,
 }
 
-impl OpenCvOrbMatcher {
-    pub fn new(max_features: i32) -> anyhow::Result<Self> {
-        anyhow::ensure!(max_features > 0, "ORB feature count must be positive");
-        let orb = ORB::create(
-            max_features,
-            1.2,
-            8,
-            31,
-            0,
-            2,
-            ORB_ScoreType::HARRIS_SCORE,
-            31,
-            20,
-        )
-        .context("failed to create OpenCV ORB detector")?;
-        let matcher = BFMatcher::create(NORM_HAMMING, false)
-            .context("failed to create OpenCV Hamming matcher")?;
-        Ok(Self {
-            orb,
-            matcher,
-            accepted: None,
-            candidate: None,
-        })
+pub(crate) fn match_frames(
+    previous: &RgbaFrame,
+    next: &RgbaFrame,
+    _direction: ScrollDirection,
+) -> Result<FrameMatch> {
+    anyhow::ensure!(
+        previous.width() == next.width() && previous.height() == next.height(),
+        "scroll frame dimensions changed"
+    );
+    let width = previous.width();
+    let height = previous.height();
+    anyhow::ensure!(
+        width >= 3 && height >= 3,
+        "capture region is too small for scrolling matching"
+    );
+
+    let inset_height = height.saturating_sub(2);
+    let identical_top = identical_edge_rows(previous, next, false);
+    if identical_top >= inset_height {
+        return Ok(no_movement());
+    }
+    let identical_bottom = identical_edge_rows(previous, next, true);
+    if identical_top.saturating_add(identical_bottom) > inset_height {
+        return Ok(no_movement());
     }
 
-    fn extract(&mut self, frame: &RgbaFrame) -> anyhow::Result<Features> {
-        let height = i32::try_from(frame.height()).context("ORB frame height exceeds i32")?;
-        let flat = Mat::from_slice(frame.pixels()).context("failed to wrap ORB RGBA frame")?;
-        let rgba = flat
-            .reshape(4, height)
-            .context("failed to shape ORB RGBA frame")?;
-        let mut grayscale = Mat::default();
-        cvt_color_def(&rgba, &mut grayscale, COLOR_RGBA2GRAY)
-            .context("failed to convert ORB frame to grayscale")?;
+    let crop_top = identical_top.max(31) - 31;
+    let crop_bottom = identical_bottom.max(31) - 31;
+    let crop_height = inset_height - crop_top - crop_bottom;
+    let previous_mat = bgra_mat(previous, 1, 1 + crop_top, width - 2, crop_height)?;
+    let next_mat = bgra_mat(next, 1, 1 + crop_top, width - 2, crop_height)?;
+    let mut orb = features2d::ORB::create(
+        2_000,
+        1.2,
+        8,
+        31,
+        0,
+        2,
+        features2d::ORB_ScoreType::HARRIS_SCORE,
+        31,
+        20,
+    )
+    .context("create scrolling ORB detector")?;
 
-        let mut keypoints = Vector::new();
-        let mut descriptors = Mat::default();
-        self.orb
-            .detect_and_compute_def(
-                &grayscale,
-                &Mat::default(),
-                &mut keypoints,
-                &mut descriptors,
-            )
-            .context("OpenCV ORB feature extraction failed")?;
-        Ok(Features {
-            keypoints,
-            descriptors,
-        })
+    let mut previous_keypoints = core::Vector::<core::KeyPoint>::new();
+    let mut previous_descriptors = Mat::default();
+    orb.detect_and_compute_def(
+        &previous_mat,
+        &Mat::default(),
+        &mut previous_keypoints,
+        &mut previous_descriptors,
+    )
+    .context("extract previous scrolling-frame features")?;
+    let mut next_keypoints = core::Vector::<core::KeyPoint>::new();
+    let mut next_descriptors = Mat::default();
+    orb.detect_and_compute_def(
+        &next_mat,
+        &Mat::default(),
+        &mut next_keypoints,
+        &mut next_descriptors,
+    )
+    .context("extract next scrolling-frame features")?;
+    if previous_descriptors.empty() || next_descriptors.empty() {
+        return Ok(no_movement());
     }
 
-    fn match_features(&self, previous: &Features, current: &Features) -> anyhow::Result<Alignment> {
-        if previous.descriptors.empty() || current.descriptors.empty() {
-            return Ok(Alignment {
-                horizontal_shift: 0.0,
-                vertical_shift: 0.0,
-                good_matches: 0,
-                inliers: 0,
-            });
+    let matcher = features2d::BFMatcher::create(core::NORM_HAMMING, false)
+        .context("create scrolling Hamming matcher")?;
+    let mut matches = core::Vector::<core::Vector<DMatch>>::new();
+    matcher
+        .knn_train_match_def(&previous_descriptors, &next_descriptors, &mut matches, 5)
+        .context("match scrolling ORB descriptors")?;
+
+    let mut offsets = Vec::new();
+    let mut groups = Vec::with_capacity(matches.len());
+    for group in matches {
+        let mut stored = Vec::with_capacity(group.len());
+        for index in 0..group.len() {
+            stored.push(
+                group
+                    .get(index)
+                    .context("read scrolling descriptor match")?,
+            );
         }
-
-        let mut nearest: Vector<Vector<DMatch>> = Vector::new();
-        self.matcher
-            .knn_train_match_def(&previous.descriptors, &current.descriptors, &mut nearest, 2)
-            .context("OpenCV ORB descriptor matching failed")?;
-
-        let mut shifts = Vec::with_capacity(nearest.len());
-        for pair in nearest {
-            if pair.len() < 2 {
-                continue;
+        if stored.len() >= 2 {
+            let best = stored[0];
+            let second = stored[1];
+            if second.distance * 0.75 > best.distance {
+                for matched in [best, second] {
+                    if matched.distance > 20.0 {
+                        continue;
+                    }
+                    let previous_point = previous_keypoints
+                        .get(matched.query_idx as usize)
+                        .context("read previous scrolling keypoint")?
+                        .pt();
+                    let next_point = next_keypoints
+                        .get(matched.train_idx as usize)
+                        .context("read next scrolling keypoint")?
+                        .pt();
+                    if (previous_point.x.round() as i32 - next_point.x.round() as i32).abs() > 4 {
+                        continue;
+                    }
+                    let mut offset = next_point.y.round() as i32 - previous_point.y.round() as i32;
+                    if offset.abs() < 2 {
+                        offset = 0;
+                    }
+                    offsets.push(offset);
+                }
             }
-            let best = pair.get(0)?;
-            let second = pair.get(1)?;
-            if best.distance >= second.distance * LOWE_RATIO {
-                continue;
-            }
-            let Some(previous_point) = keypoint(&previous.keypoints, best.query_idx) else {
-                continue;
-            };
-            let Some(current_point) = keypoint(&current.keypoints, best.train_idx) else {
-                continue;
-            };
-            shifts.push((
-                previous_point.x - current_point.x,
-                previous_point.y - current_point.y,
-            ));
         }
-        Ok(estimate_alignment(&shifts))
+        groups.push(stored);
     }
-}
+    if offsets.is_empty() {
+        return Ok(no_movement());
+    }
 
-impl FrameMatcher for OpenCvOrbMatcher {
-    fn align(&mut self, previous: &RgbaFrame, current: &RgbaFrame) -> anyhow::Result<Alignment> {
-        if self.accepted.is_none() {
-            self.accepted = Some(self.extract(previous)?);
+    let mut displacements = Vec::with_capacity(offsets.len());
+    for matched in groups.iter().flatten() {
+        if matched.distance > 20.0 {
+            continue;
         }
-        let candidate = self.extract(current)?;
-        let alignment = self.match_features(
-            self.accepted
-                .as_ref()
-                .expect("accepted ORB features were initialized"),
-            &candidate,
-        )?;
-        self.candidate = Some(candidate);
-        Ok(alignment)
+        let previous_point = previous_keypoints
+            .get(matched.query_idx as usize)
+            .context("read previous scrolling vote keypoint")?
+            .pt();
+        let next_point = next_keypoints
+            .get(matched.train_idx as usize)
+            .context("read next scrolling vote keypoint")?
+            .pt();
+        displacements.push((
+            previous_point.x.round() as i32 - next_point.x.round() as i32,
+            next_point.y.round() as i32 - previous_point.y.round() as i32,
+        ));
     }
+    Ok(select_shift(&offsets, &displacements, height))
+}
 
-    fn accept_alignment(&mut self) {
-        self.accepted = self.candidate.take();
+fn no_movement() -> FrameMatch {
+    FrameMatch {
+        shift: 0,
+        raw_shift: 0,
+        rejected: false,
     }
 }
 
-struct Features {
-    keypoints: Vector<KeyPoint>,
-    descriptors: Mat,
-}
-
-fn keypoint(keypoints: &Vector<KeyPoint>, index: i32) -> Option<opencv::core::Point2f> {
-    usize::try_from(index)
-        .ok()
-        .and_then(|index| keypoints.get(index).ok())
-        .map(|point| point.pt())
-}
-
-fn estimate_alignment(shifts: &[(f32, f32)]) -> Alignment {
-    if shifts.is_empty() {
-        return Alignment {
-            horizontal_shift: 0.0,
-            vertical_shift: 0.0,
-            good_matches: 0,
-            inliers: 0,
-        };
+fn select_shift(offsets: &[i32], displacements: &[(i32, i32)], height: u32) -> FrameMatch {
+    let mut exact_counts = BTreeMap::<i32, usize>::new();
+    for &offset in offsets {
+        *exact_counts.entry(offset).or_default() += 1;
     }
-
-    let center_x = median(shifts.iter().map(|shift| shift.0));
-    let center_y = median(shifts.iter().map(|shift| shift.1));
-    let deviation_x = median(shifts.iter().map(|shift| (shift.0 - center_x).abs()));
-    let deviation_y = median(shifts.iter().map(|shift| (shift.1 - center_y).abs()));
-    let tolerance_x = (deviation_x * 2.5).clamp(MINIMUM_INLIER_TOLERANCE, MAXIMUM_INLIER_TOLERANCE);
-    let tolerance_y = (deviation_y * 2.5).clamp(MINIMUM_INLIER_TOLERANCE, MAXIMUM_INLIER_TOLERANCE);
-    let inliers = shifts
-        .iter()
-        .copied()
-        .filter(|shift| {
-            (shift.0 - center_x).abs() <= tolerance_x && (shift.1 - center_y).abs() <= tolerance_y
-        })
-        .collect::<Vec<_>>();
-
-    Alignment {
-        horizontal_shift: median(inliers.iter().map(|shift| shift.0)),
-        vertical_shift: median(inliers.iter().map(|shift| shift.1)),
-        good_matches: shifts.len() as u32,
-        inliers: inliers.len() as u32,
+    let zero_votes = exact_counts.get(&0).copied().unwrap_or(0);
+    let candidates = exact_counts.into_iter().filter_map(|(candidate, count)| {
+        (zero_votes.saturating_add(count.saturating_mul(SUPPORT_WEIGHT)) >= offsets.len())
+            .then_some(candidate)
+    });
+    let mut shift = 0;
+    let mut support = 0;
+    let mut has_candidate = false;
+    for candidate in candidates {
+        has_candidate = true;
+        let votes = displacements
+            .iter()
+            .filter(|&&(dx, dy)| dx.abs() <= 4 && (dy - candidate).abs() <= 1)
+            .count();
+        if votes >= support {
+            shift = candidate;
+        }
+        support = support.max(votes);
+    }
+    if !has_candidate {
+        shift = 999_999;
+    }
+    let rejected = shift.unsigned_abs() > height.saturating_mul(3) / 5;
+    FrameMatch {
+        shift: if rejected { 0 } else { shift },
+        raw_shift: shift,
+        rejected,
     }
 }
 
-fn median(values: impl Iterator<Item = f32>) -> f32 {
-    let mut values = values.collect::<Vec<_>>();
-    if values.is_empty() {
-        return 0.0;
+fn bgra_mat(image: &RgbaFrame, left: u32, top: u32, width: u32, height: u32) -> Result<Mat> {
+    let stride = image.width() as usize * 4;
+    let mut bgra = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in top..top + height {
+        let start = row as usize * stride + left as usize * 4;
+        for pixel in image.pixels()[start..start + width as usize * 4].chunks_exact(4) {
+            bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
     }
-    values.sort_unstable_by(f32::total_cmp);
-    let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
-        (values[middle - 1] + values[middle]) * 0.5
+    Mat::from_slice(&bgra)
+        .and_then(|mat| mat.reshape(4, height as i32)?.try_clone())
+        .context("construct scrolling OpenCV image")
+}
+
+fn identical_edge_rows(left: &RgbaFrame, right: &RgbaFrame, from_bottom: bool) -> u32 {
+    let width = left.width().min(right.width());
+    let height = left.height().min(right.height());
+    if width <= 2 || height <= 2 {
+        return 0;
+    }
+    let compared = width - 2;
+    let rows: Box<dyn Iterator<Item = u32>> = if from_bottom {
+        Box::new((1..height - 1).rev())
     } else {
-        values[middle]
-    }
+        Box::new(1..height - 1)
+    };
+    let left_stride = left.width() as usize * 4;
+    let right_stride = right.width() as usize * 4;
+    rows.take_while(|&row| {
+        let left_row = &left.pixels()[row as usize * left_stride..];
+        let right_row = &right.pixels()[row as usize * right_stride..];
+        (1..=compared).all(|x| {
+            let at = x as usize * 4;
+            left_row[at..at + 3] == right_row[at..at + 3]
+        })
+    })
+    .count() as u32
 }
 
 #[cfg(test)]
@@ -196,66 +242,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn robust_alignment_ignores_displacement_outliers() {
-        let alignment = estimate_alignment(&[
-            (0.0, 40.0),
-            (0.5, 39.5),
-            (-0.5, 40.5),
-            (0.25, 40.25),
-            (45.0, -120.0),
-        ]);
-
-        assert!((alignment.horizontal_shift - 0.125).abs() < 0.2);
-        assert!((alignment.vertical_shift - 40.125).abs() < 0.2);
-        assert_eq!(alignment.good_matches, 5);
-        assert_eq!(alignment.inliers, 4);
+    fn tied_candidates_choose_the_later_offset() {
+        let result = select_shift(&[3, 3, 7, 7], &[(0, 3), (0, 3), (0, 7), (0, 7)], 100);
+        assert_eq!(result.shift, 7);
     }
 
     #[test]
-    fn empty_matches_produce_zero_confidence() {
-        assert_eq!(
-            estimate_alignment(&[]),
-            Alignment {
-                horizontal_shift: 0.0,
-                vertical_shift: 0.0,
-                good_matches: 0,
-                inliers: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn opencv_orb_recovers_a_real_vertical_frame_shift() {
-        let previous = patterned_view(0);
-        let current = patterned_view(24);
-        let mut matcher = OpenCvOrbMatcher::new(1_200).unwrap();
-        let alignment = matcher.align(&previous, &current).unwrap();
-
-        assert!(alignment.good_matches >= 12, "{alignment:?}");
-        assert!(alignment.inlier_ratio() >= 0.55, "{alignment:?}");
-        assert!(alignment.horizontal_shift.abs() <= 2.0, "{alignment:?}");
-        assert!(
-            (alignment.vertical_shift - 24.0).abs() <= 2.0,
-            "{alignment:?}"
-        );
-    }
-
-    fn patterned_view(start_y: u32) -> RgbaFrame {
-        const WIDTH: u32 = 320;
-        const HEIGHT: u32 = 180;
-        let mut pixels = Vec::with_capacity(WIDTH as usize * HEIGHT as usize * 4);
-        for y in start_y..start_y + HEIGHT {
-            for x in 0..WIDTH {
-                let block = ((x / 11) * 37 + (y / 9) * 53 + ((x + y) / 17) * 29) as u8;
-                let edge = if x % 31 < 3 || y % 27 < 3 { 220 } else { block };
-                pixels.extend_from_slice(&[
-                    edge,
-                    edge.wrapping_add(17),
-                    edge.wrapping_add(41),
-                    255,
-                ]);
-            }
-        }
-        RgbaFrame::new(crate::model::RectI::new(0, 0, WIDTH, HEIGHT), pixels).unwrap()
+    fn offsets_beyond_sixty_percent_are_rejected() {
+        let result = select_shift(&[61], &[(0, 61)], 100);
+        assert!(result.rejected);
+        assert_eq!(result.raw_shift, 61);
+        assert_eq!(result.shift, 0);
     }
 }

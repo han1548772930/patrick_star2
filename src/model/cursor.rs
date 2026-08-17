@@ -1,4 +1,4 @@
-use super::{AnnotationKind, Handle, OverlaySession, Phase, Point, Tool};
+use super::{AnnotationKind, Editor, Handle, OverlaySession, Phase, Point, Rect, Tool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerCursor {
@@ -7,12 +7,48 @@ pub enum PointerCursor {
     Hand,
     IBeam,
     Move,
+    Grab,
+    Grabbing,
     ResizeNorthSouth,
     ResizeEastWest,
     ResizeNorthEastSouthWest,
     ResizeNorthWestSouthEast,
     NotAllowed,
     Hidden,
+}
+
+pub fn preview_cursor(editor: &Editor, point: Point, bounds: Rect) -> PointerCursor {
+    if let Some(handle) = editor.drag_handle() {
+        return resize_cursor(handle);
+    }
+    if editor.is_editing_text() {
+        return editor
+            .grip_under(point)
+            .filter(|handle| *handle != Handle::Move)
+            .map_or(PointerCursor::IBeam, resize_cursor);
+    }
+    if let Some(handle) = editor.grip_under(point) {
+        if handle != Handle::Move {
+            return resize_cursor(handle);
+        }
+        return if editor
+            .selected_annotation()
+            .is_some_and(|annotation| matches!(annotation.kind, AnnotationKind::Text { .. }))
+        {
+            PointerCursor::Arrow
+        } else {
+            PointerCursor::Move
+        };
+    }
+    if !bounds.contains(point) {
+        return PointerCursor::Arrow;
+    }
+    match editor.tool() {
+        Tool::Rectangle | Tool::Circle | Tool::Arrow | Tool::Pen => PointerCursor::Crosshair,
+        Tool::Text => PointerCursor::IBeam,
+        Tool::Mosaic => PointerCursor::Hidden,
+        Tool::Select | Tool::Emotion => PointerCursor::Arrow,
+    }
 }
 
 pub const fn resize_cursor(handle: Handle) -> PointerCursor {

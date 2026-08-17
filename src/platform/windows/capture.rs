@@ -9,9 +9,6 @@ use windows_sys::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SRCCOPY,
     SelectObject,
 };
-use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
@@ -19,9 +16,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::model::{DesktopFrame, RectI, RgbaFrame};
 
 pub fn capture_virtual_desktop() -> Result<DesktopFrame> {
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
     let bounds = virtual_desktop_bounds();
     anyhow::ensure!(
         bounds.width() > 0 && bounds.height() > 0,

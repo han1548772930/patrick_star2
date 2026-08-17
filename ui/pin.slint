@@ -1,0 +1,79 @@
+import { Win32TitleBar } from "@slint-borderless/titlebar.slint";
+
+component PinButton inherits Rectangle {
+    in property <bool> active: true;
+    callback clicked;
+
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    background: root.active ? #d0e4f3 : touch.has-hover ? #bfbfbf : transparent;
+
+    Image {
+        x: 6px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        source: @image-url("../assets/icons/pin.svg");
+        image-fit: contain;
+        colorize: root.active ? #0078d4 : #000000;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: "Pin";
+        clicked => { root.clicked(); }
+    }
+}
+
+export component PinWindow inherits Window {
+    title: "Patrick Star Pin";
+    preferred-width: 480px;
+    preferred-height: 360px;
+    min-width: 160px;
+    min-height: 90px;
+    background: #17191d;
+
+    in property <image> pinned-image;
+    in property <int> caption-hover: 0;
+    in property <bool> pin-active: true;
+    callback pin-toggle-requested;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 30px;
+            background: #f0f0f0;
+
+            Win32TitleBar {
+                width: parent.width;
+                height: parent.height;
+                button-width: 48px;
+                hover-button: root.caption-hover;
+                background-color: #f0f0f0;
+                foreground-color: #000000;
+                hover-color: #bfbfbf;
+            }
+
+            PinButton {
+                x: 8px;
+                active: root.pin-active;
+                clicked => { root.pin-toggle-requested(); }
+            }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: #17191d;
+
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: root.pinned-image;
+                image-fit: contain;
+            }
+        }
+    }
+}

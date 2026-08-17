@@ -44,6 +44,7 @@ impl Host {
             PointerCursor::Hand => self.hand,
             PointerCursor::IBeam => self.ibeam,
             PointerCursor::Move => self.move_,
+            PointerCursor::Grab | PointerCursor::Grabbing => self.move_,
             PointerCursor::ResizeNorthSouth => self.north_south,
             PointerCursor::ResizeEastWest => self.east_west,
             PointerCursor::ResizeNorthEastSouthWest => self.north_east_south_west,

@@ -178,7 +178,7 @@ src/ocr/          OCR 任务和结果
 2026-08-16 后续实现状态：
 
 - Windows OCR 使用系统 `Windows.Media.Ocr`，输入直接取 FBO 最终合成的顶向下 RGBA 帧；WinRT 初始化、可用语言枚举、指定语言、图像尺寸上限、Gray8 转换、行/词边界和文本角度均在 `platform/windows/ocr.rs` 内完成。识别文本通过独立 `TextClipboard` trait 写入 `CF_UNICODETEXT`，不重新截图，也不在覆盖层事件回调中执行 OCR。语言选择命令在选择 UI 接通前继续禁用。
-- OpenCV 4.12 的 x64/VC17 静态 SDK 已迁入新项目自己的 `third_party/opencv-4.12-static`；Cargo 使用项目相对路径发现 `core`、`imgproc`、`features2d` 和 `zlib`，默认启用真实 `opencv` crate ORB 绑定，不依赖旧项目目录、系统 OpenCV 安装或运行时 DLL。
+- OpenCV 4.5.5 的 x64/VC17 静态 SDK 已迁入新项目自己的 `third_party/opencv-4.5.5-static`；Cargo 使用项目相对路径发现 `core`、`imgproc`、`features2d` 和 `zlib`，默认启用真实 `opencv` crate ORB 绑定，不依赖旧项目目录、系统 OpenCV 安装或运行时 DLL。
 - 滚动截图公共层固定为“采样指纹帧去重 -> OpenCV ORB 特征与描述子 -> Hamming KNN/Lowe ratio -> 位移中位数/MAD 内点 -> 重叠行定位 -> 仅追加新底部行”。上一张已接受帧的 ORB 特征会跨帧缓存，拒绝帧不会污染缓存；算法没有替换成模板匹配或单纯像素差。
 - `ScrollCaptureSource`/`ActiveScrollCapture` 与 `ScrollPreviewHost`/`ScrollPreview` 是两组独立的小型平台接口。公共 `scroll` 只持有 RGBA 帧、匹配结果、拼接文档和预览脏区，不包含 HWND、WGL、AppKit、X11 或 Wayland 句柄；macOS、X11 和 Wayland 各自保留明确实现位置并报告真实 capability。
 - Windows 滚动采集源在会话开始时只创建一次 GDI DC/DIB，通过低级鼠标/键盘 hook 观察选区内滚轮，等待滚动稳定后抓取区域帧；Enter 结束、Escape 取消。右侧预览是独立 Win32 + WGL/OpenGL 宿主，使用最多 2048 行的分块纹理和 `glTexSubImage2D` 增量上传，不因长图增长反复上传全部拼接结果，也不受单张超长纹理高度限制。
@@ -215,6 +215,6 @@ src/ocr/          OCR 任务和结果
 2026-08-16 覆盖窗口退出与预览标题栏回归修正：
 
 - Windows 全屏覆盖层结束嵌套消息循环后，先释放鼠标捕获、隐藏仍持有有效前缓冲的原生窗口并等待一次 DWM 合成，再清除窗口状态、释放 OpenGL/WGL 资源和销毁 HWND。取消按钮、Escape、右键取消和正常输出共用这一退出时序，避免先销毁渲染资源后桌面短暂保留最后一帧遮罩。
-- 普通预览和 OCR 预览恢复为一个 60px 的两行自定义标题栏：第一行放缩放、原始大小、适应窗口、旋转、撤销/重做、复制、保存以及最小化、最大化/还原、关闭三个窗口按钮，第二行放标注工具；图片画布和 OCR 文本面板统一从标题栏之后开始。窗口按钮固定保留 144px，原始 SVG 图标按 18px 栅格显示。
-- Windows 非客户区命中不再把整条顶栏都当成拖动区域。缩放边缘、左侧命令、中央空白拖动区、右侧输出/窗口按钮和第二行标注命令分别命中，100%/150% DPI 使用同一组逻辑布局常量；画布 OpenGL 原点、Slint 内容区域和原生系统光标也共用 60px 标题栏高度。
+- 普通预览和 OCR 预览恢复为一个 60px 的两行头部：第一行是 30px 原生自定义标题栏，放缩放、原始大小、适应窗口、旋转、撤销/重做、复制、保存以及最小化、最大化/还原、关闭三个窗口按钮；第二行是 30px Slint 客户区标注工具栏。图片画布和 OCR 文本面板统一从两行头部之后开始。窗口按钮固定保留 144px，原始 SVG 图标按 18px 栅格显示。
+- Windows 非客户区命中不再把整条顶栏都当成拖动区域。原生 frame 只覆盖第一行 30px，缩放边缘、左侧命令、中央空白拖动区和右侧输出/窗口按钮分别命中；第二行标注命令始终保留为 Slint 客户区。100%/150% DPI 使用同一组逻辑布局常量；画布 OpenGL 原点、Slint 内容区域和原生系统光标则共用 60px 总头部高度。
 - 本轮 `cargo check --all-targets`、`cargo fmt --all --check`、`cargo test`（130 项）和 `cargo clippy --all-targets -- -D warnings` 通过。按约定未启动窗口、未执行截图，也未执行 release 构建。

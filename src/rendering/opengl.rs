@@ -75,6 +75,7 @@ impl OverlayRenderer {
         &mut self,
         width: u32,
         height: u32,
+        dpi_scale: f32,
         frame: &DesktopFrame,
         session: &OverlaySession,
     ) {
@@ -104,6 +105,7 @@ impl OverlayRenderer {
             &self.fonts,
             &mut self.emojis,
             &self.toolbar_icons,
+            dpi_scale,
         );
         self.canvas.flush();
     }
@@ -115,6 +117,7 @@ impl OverlayRenderer {
         selection: Rect,
         hovered: Option<ScrollAction>,
         pressed: Option<ScrollAction>,
+        dpi_scale: f32,
     ) {
         let surface = Rect::new(0.0, 0.0, width as f32, height as f32);
         unsafe {
@@ -141,10 +144,11 @@ impl OverlayRenderer {
         stroke_rect(&mut self.canvas, selection, Color::rgb(0, 120, 212), 1.5);
         paint_scroll_action_bar(
             &mut self.canvas,
-            ScrollLayout::new(selection, surface),
+            ScrollLayout::new_scaled(selection, surface, dpi_scale),
             hovered,
             pressed,
             &self.toolbar_icons,
+            dpi_scale,
         );
         self.canvas.flush();
     }
@@ -974,6 +978,7 @@ fn paint_overlay(
     fonts: &[FontId],
     emojis: &mut EmojiRenderer,
     toolbar_icons: &ToolbarIcons,
+    dpi_scale: f32,
 ) {
     let Some(region) = session.selection().rect() else {
         paint_mask(
@@ -1016,11 +1021,12 @@ fn paint_overlay(
     paint_size_badge(canvas, region, surface, fonts.first().copied());
     paint_action_bar(
         canvas,
-        OverlayLayout::for_tool(region, surface, session.active_tool()),
+        OverlayLayout::for_tool_scaled(region, surface, session.active_tool(), dpi_scale),
         session,
         fonts,
         emojis,
         toolbar_icons,
+        dpi_scale,
     );
 }
 
@@ -1530,6 +1536,7 @@ fn paint_action_bar(
     fonts: &[FontId],
     emojis: &mut EmojiRenderer,
     toolbar_icons: &ToolbarIcons,
+    dpi_scale: f32,
 ) {
     let mut bar = Path::new();
     bar.rounded_rect(
@@ -1580,10 +1587,18 @@ fn paint_action_bar(
                 _ => Color::rgb(0, 0, 0),
             }
         };
-        toolbar_icons.paint(canvas, button.action, button.bounds, glyph);
+        toolbar_icons.paint(canvas, button.action, button.bounds, glyph, dpi_scale);
     }
     if let Some(options) = layout.options {
-        paint_options(canvas, options, session, fonts, emojis, toolbar_icons);
+        paint_options(
+            canvas,
+            options,
+            session,
+            fonts,
+            emojis,
+            toolbar_icons,
+            dpi_scale,
+        );
     }
 }
 
@@ -1593,6 +1608,7 @@ fn paint_scroll_action_bar(
     hovered: Option<ScrollAction>,
     pressed: Option<ScrollAction>,
     toolbar_icons: &ToolbarIcons,
+    dpi_scale: f32,
 ) {
     let mut bar = Path::new();
     bar.rounded_rect(
@@ -1627,7 +1643,7 @@ fn paint_scroll_action_bar(
             ScrollAction::Cancel => (OverlayAction::Cancel, Color::rgb(250, 81, 81)),
             ScrollAction::Confirm => (OverlayAction::Confirm, Color::rgb(0, 195, 117)),
         };
-        toolbar_icons.paint(canvas, icon, button.bounds, color);
+        toolbar_icons.paint(canvas, icon, button.bounds, color, dpi_scale);
     }
 }
 
@@ -1638,6 +1654,7 @@ fn paint_options(
     fonts: &[FontId],
     emojis: &mut EmojiRenderer,
     toolbar_icons: &ToolbarIcons,
+    dpi_scale: f32,
 ) {
     let mut bar = Path::new();
     bar.rounded_rect(
@@ -1684,6 +1701,7 @@ fn paint_options(
             fonts,
             emojis,
             toolbar_icons,
+            dpi_scale,
         );
     }
 }
@@ -1696,6 +1714,7 @@ fn paint_option_icon(
     fonts: &[FontId],
     emojis: &mut EmojiRenderer,
     toolbar_icons: &ToolbarIcons,
+    dpi_scale: f32,
 ) {
     let center = bounds.center();
     let foreground = if active {
@@ -1709,7 +1728,7 @@ fn paint_option_icon(
                 return;
             };
             let mut dot = Path::new();
-            dot.circle(center.x, center.y, width * 0.5);
+            dot.circle(center.x, center.y, width * dpi_scale * 0.5);
             canvas.fill_path(&dot, &Paint::color(foreground));
         }
         OverlayOption::TextSize(index) => {
@@ -1719,7 +1738,8 @@ fn paint_option_icon(
             if fonts.is_empty() {
                 return;
             }
-            let display_size = (10.0 + size * 0.3).min(bounds.height() - 4.0);
+            let display_size =
+                ((10.0 + size * 0.3) * dpi_scale).min(bounds.height() - 4.0 * dpi_scale);
             let paint = Paint::color(foreground)
                 .with_font(fonts)
                 .with_font_size(display_size)
@@ -1728,20 +1748,22 @@ fn paint_option_icon(
             let _ = canvas.fill_text(center.x, center.y, "A", &paint);
         }
         OverlayOption::ToggleFill => {
-            toolbar_icons.paint_fill(canvas, bounds, foreground);
+            toolbar_icons.paint_fill(canvas, bounds, foreground, dpi_scale);
         }
         OverlayOption::Color(index) => {
             let Some(color) = TOOLBAR_COLORS.get(index as usize) else {
                 return;
             };
-            let size = 16.0_f32.min(bounds.width() - 4.0).max(1.0);
+            let size = (16.0 * dpi_scale)
+                .min(bounds.width() - 4.0 * dpi_scale)
+                .max(1.0);
             let mut swatch = Path::new();
             swatch.rounded_rect(
                 center.x - size * 0.5,
                 center.y - size * 0.5,
                 size,
                 size,
-                2.0,
+                2.0 * dpi_scale,
             );
             canvas.fill_path(&swatch, &Paint::color(model_color(*color, 1.0)));
             let border = if *color == Rgba::WHITE {
@@ -1751,13 +1773,16 @@ fn paint_option_icon(
             } else {
                 Color::rgba(0, 0, 0, 80)
             };
-            canvas.stroke_path(&swatch, &Paint::color(border).with_line_width(1.0));
+            canvas.stroke_path(
+                &swatch,
+                &Paint::color(border).with_line_width(dpi_scale.max(1.0)),
+            );
         }
         OverlayOption::MosaicBlock(index) => {
             let Some(size) = MOSAIC_BLOCK_SIZES.get(index as usize) else {
                 return;
             };
-            let radius = (*size as f32 * 0.25).min(bounds.width() * 0.4);
+            let radius = (*size as f32 * dpi_scale * 0.25).min(bounds.width() * 0.4);
             let mut preview = Path::new();
             preview.circle(center.x, center.y, radius);
             canvas.fill_path(&preview, &Paint::color(Color::rgba(96, 96, 96, 180)));
@@ -1766,7 +1791,7 @@ fn paint_option_icon(
             let Some(emotion) = EMOTIONS.get(index as usize) else {
                 return;
             };
-            let glyph_bounds = bounds.inflated(-1.5);
+            let glyph_bounds = bounds.inflated(-1.5 * dpi_scale);
             if emojis.paint(canvas, emotion, glyph_bounds, 1.0) {
                 return;
             }
@@ -1775,7 +1800,7 @@ fn paint_option_icon(
             }
             let paint = Paint::color(foreground)
                 .with_font(fonts)
-                .with_font_size((bounds.height() - 3.0).max(1.0))
+                .with_font_size((bounds.height() - 3.0 * dpi_scale).max(1.0))
                 .with_text_align(Align::Center)
                 .with_text_baseline(Baseline::Middle);
             let _ = canvas.fill_text(center.x, center.y, emotion, &paint);

@@ -1,0 +1,575 @@
+import { TextEdit } from "std-widgets.slint";
+import { Win32TitleBar } from "@slint-borderless/titlebar.slint";
+
+component VectorButton inherits Rectangle {
+    in property <string> icon-data;
+    in property <string> label;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    background: !root.enabled ? transparent
+        : root.active ? #d0e4f3
+        : touch.has-hover ? #bfbfbf
+        : transparent;
+
+    Path {
+        x: 6px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon-data;
+        fill: transparent;
+        stroke: !root.enabled ? #9e9e9e : root.active ? #0078d4 : #000000;
+        stroke-width: 1.5px;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.clicked(); }
+    }
+}
+
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    background: !root.enabled ? transparent
+        : root.active ? #d0e4f3
+        : touch.has-hover ? #bfbfbf
+        : transparent;
+
+    Image {
+        x: 6px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        source: root.icon;
+        image-fit: contain;
+        colorize: !root.enabled ? #9e9e9e : root.active ? #0078d4 : #000000;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.clicked(); }
+    }
+}
+
+component OptionButton inherits Rectangle {
+    in property <int> visual-kind: 0; // stroke, text, fill, color, mosaic, emotion
+    in property <float> value: 0;
+    in property <color> swatch: transparent;
+    in property <string> glyph;
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked;
+
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    background: root.active ? #dcecff : touch.has-hover ? #dedede : transparent;
+
+    if root.visual-kind == 0: Rectangle {
+        width: root.value * 1px;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: root.active ? #0078d4 : #202124;
+    }
+
+    if root.visual-kind == 1: Text {
+        width: parent.width;
+        height: parent.height;
+        text: "A";
+        color: root.active ? #0078d4 : #202124;
+        font-size: root.value == 12 ? 12px : root.value == 20 ? 15px : 18px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.visual-kind == 2: Image {
+        x: 5px;
+        y: 5px;
+        width: 18px;
+        height: 18px;
+        source: @image-url("../assets/icons/filling.svg");
+        image-fit: contain;
+        colorize: root.active ? #0078d4 : #202124;
+    }
+
+    if root.visual-kind == 3: Rectangle {
+        x: 6px;
+        y: 6px;
+        width: 16px;
+        height: 16px;
+        border-radius: 3px;
+        background: root.swatch;
+        border-width: root.swatch == #ffffff ? 1px : root.active ? 2px : 1px;
+        border-color: root.active ? #0078d4 : #707070;
+    }
+
+    if root.visual-kind == 4: Rectangle {
+        width: root.value == 10 ? 6px : root.value == 16 ? 9px : 12px;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: root.active ? #0078d4 : #606060;
+    }
+
+    if root.visual-kind == 5: Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.glyph;
+        font-size: 19px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.clicked(); }
+    }
+}
+
+component OptionRow inherits Rectangle {
+    in property <[float]> values;
+    in property <int> value-visual-kind;
+    in property <string> value-label;
+    in property <int> value-code-base;
+    in property <int> active-value: -1;
+    in property <bool> show-fill: false;
+    in property <bool> fill-active: false;
+    in property <[color]> colors;
+    in property <int> active-color: -1;
+    callback choose(int);
+
+    min-width: row.min-width;
+    min-height: row.min-height;
+    preferred-width: row.preferred-width;
+    preferred-height: row.preferred-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    background: transparent;
+
+    row := HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 3px;
+        padding-bottom: 6px;
+        spacing: 2px;
+        alignment: start;
+        cross-axis-alignment: center;
+
+        for value[index] in root.values: OptionButton {
+            visual-kind: root.value-visual-kind;
+            value: value;
+            label: root.value-label;
+            active: root.active-value == index;
+            clicked => { root.choose(root.value-code-base + index); }
+        }
+        if root.show-fill: OptionButton {
+            visual-kind: 2;
+            label: "Fill";
+            active: root.fill-active;
+            clicked => { root.choose(3); }
+        }
+        for color[index] in root.colors: OptionButton {
+            visual-kind: 3;
+            swatch: color;
+            label: "Color";
+            active: root.active-color == index;
+            clicked => { root.choose(10 + index); }
+        }
+    }
+}
+
+component EmotionOptions inherits Rectangle {
+    in property <[string]> emotions;
+    in property <int> active-emotion: -1;
+    callback choose(int);
+
+    property <int> columns: max(1, min(8, root.emotions.length));
+    min-width: max(44px, options.min-width);
+    min-height: options.min-height;
+    preferred-width: max(44px, options.preferred-width);
+    preferred-height: options.preferred-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    background: transparent;
+
+    options := GridLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 3px;
+        padding-bottom: 4px;
+        spacing-horizontal: 2px;
+        spacing-vertical: 0px;
+
+        for emotion[index] in root.emotions: OptionButton {
+            row: floor(index / root.columns);
+            col: mod(index, root.columns);
+            visual-kind: 5;
+            glyph: emotion;
+            label: "Emotion";
+            active: root.active-emotion == index;
+            clicked => { root.choose(40 + index); }
+        }
+    }
+}
+
+export component PreviewWindow inherits Window {
+    preferred-width: 960px;
+    preferred-height: 680px;
+    min-width: 560px;
+    min-height: 200px;
+    background: #17191d;
+    title: root.preview-title;
+    default-font-size: 13px;
+
+    in property <string> preview-title: "Patrick Star";
+    in property <int> caption-hover: 0;
+    in property <bool> ocr-panel-visible: false;
+    in property <string> ocr-text;
+    in property <int> active-tool: 0;
+    in property <bool> pan-active: false;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    in property <int> zoom-percent: 100;
+    in property <int> active-stroke-width: 0;
+    in property <bool> fill-active: false;
+    in property <int> active-color: 0;
+    in property <int> active-text-size: 0;
+    in property <int> active-mosaic-size: 1;
+    in property <int> active-emotion: 0;
+    in property <[string]> emotions;
+
+    property <int> options-open-tool: -1;
+    property <int> popup-visual-index: root.options-open-tool == 3 ? 7
+        : root.options-open-tool >= 4 ? root.options-open-tool - 1
+        : root.options-open-tool;
+    property <[color]> option-colors: [
+        #0078d4, #10893e, #ffd700, #505050, #ffffff, #e81123, #000000
+    ];
+    out property <length> canvas-width: canvas.width;
+    out property <length> canvas-height: canvas.height;
+    out property <length> canvas-x: content.x + canvas.x;
+    out property <length> canvas-y: content.y + canvas.y;
+    out property <length> options-popup-x: options-popup.x;
+    out property <length> options-popup-y: options-popup.y;
+    out property <length> options-popup-width: options-popup.width;
+    out property <length> options-popup-height: options-popup.height;
+    out property <bool> options-popup-visible: options-popup.visible;
+    callback choose-tool(int);
+    callback choose-option(int);
+    callback choose-pan;
+    callback undo;
+    callback redo;
+    callback zoom-in;
+    callback zoom-out;
+    callback actual-size;
+    callback fit;
+    callback rotate;
+    callback copy;
+    callback save;
+    callback canvas-press(float, float);
+    callback canvas-double-click(float, float);
+    callback canvas-move(float, float);
+    callback canvas-release;
+    callback canvas-scroll(float, float, float);
+    callback key-input(string, bool, bool, bool) -> bool;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 30px;
+
+            Win32TitleBar {
+                width: parent.width;
+                height: parent.height;
+                button-width: 48px;
+                hover-button: root.caption-hover;
+                background-color: #f0f0f0;
+                foreground-color: #000000;
+                hover-color: #bfbfbf;
+            }
+
+            HorizontalLayout {
+                x: 8px;
+                width: max(0px, parent.width - 152px);
+                height: parent.height;
+                spacing: 2px;
+                alignment: start;
+
+                IconButton { icon: @image-url("../assets/icons/zoom-in.svg"); label: "Zoom in"; clicked => { root.options-open-tool = -1; root.zoom-in(); } }
+                IconButton { icon: @image-url("../assets/icons/zoom-out.svg"); label: "Zoom out"; clicked => { root.options-open-tool = -1; root.zoom-out(); } }
+                IconButton { icon: @image-url("../assets/icons/actual-size.svg"); label: "Actual size"; clicked => { root.options-open-tool = -1; root.actual-size(); } }
+                IconButton { icon: @image-url("../assets/icons/fit-to-window.svg"); label: "Fit to window"; clicked => { root.options-open-tool = -1; root.fit(); } }
+                IconButton { icon: @image-url("../assets/icons/rotate-left.svg"); label: "Rotate"; clicked => { root.options-open-tool = -1; root.rotate(); } }
+                Rectangle { width: 1px; height: 20px; background: #bfbfbf; }
+                IconButton { icon: @image-url("../assets/icons/undo-2.svg"); label: "Undo"; enabled: root.can-undo; clicked => { root.options-open-tool = -1; root.undo(); } }
+                VectorButton { icon-data: "M 15 8 L 20 13 L 15 18 M 20 13 L 9 13 C 6 13 4 15 4 18"; label: "Redo"; enabled: root.can-redo; clicked => { root.options-open-tool = -1; root.redo(); } }
+                Rectangle { horizontal-stretch: 1; }
+                VectorButton { icon-data: "M 8 8 L 20 8 L 20 20 L 8 20 Z M 4 16 L 4 4 L 16 4"; label: "Copy"; clicked => { root.options-open-tool = -1; root.copy(); } }
+                IconButton { icon: @image-url("../assets/icons/download.svg"); label: "Save"; clicked => { root.options-open-tool = -1; root.save(); } }
+            }
+        }
+
+        Rectangle {
+            height: 30px;
+            background: #f0f0f0;
+
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 2px;
+                alignment: start;
+
+                IconButton { icon: @image-url("../assets/icons/edit.svg"); label: "Select"; active: root.active-tool == 0 && !root.pan-active; clicked => { root.options-open-tool = -1; root.choose-tool(0); } }
+                IconButton { icon: @image-url("../assets/icons/square.svg"); label: "Rectangle"; active: root.active-tool == 1 && !root.pan-active; clicked => { root.choose-tool(1); root.options-open-tool = 1; } }
+                IconButton { icon: @image-url("../assets/icons/circle.svg"); label: "Ellipse"; active: root.active-tool == 2 && !root.pan-active; clicked => { root.choose-tool(2); root.options-open-tool = 2; } }
+                IconButton { icon: @image-url("../assets/icons/move-up-right.svg"); label: "Arrow"; active: root.active-tool == 4 && !root.pan-active; clicked => { root.choose-tool(4); root.options-open-tool = 4; } }
+                IconButton { icon: @image-url("../assets/icons/pen.svg"); label: "Pen"; active: root.active-tool == 5 && !root.pan-active; clicked => { root.choose-tool(5); root.options-open-tool = 5; } }
+                IconButton { icon: @image-url("../assets/icons/mosaic.svg"); label: "Mosaic"; active: root.active-tool == 6 && !root.pan-active; clicked => { root.choose-tool(6); root.options-open-tool = 6; } }
+                IconButton { icon: @image-url("../assets/icons/type.svg"); label: "Text"; active: root.active-tool == 7 && !root.pan-active; clicked => { root.choose-tool(7); root.options-open-tool = 7; } }
+                IconButton { icon: @image-url("../assets/icons/emotion.svg"); label: "Emotion"; active: root.active-tool == 3 && !root.pan-active; clicked => { root.choose-tool(3); root.options-open-tool = 3; } }
+
+                Rectangle { width: 1px; height: 20px; background: #bfbfbf; }
+
+                VectorButton { icon-data: "M 8 12 L 4 12 L 4 8 M 4 12 C 6 6 15 5 19 10 M 16 12 L 20 12 L 20 16 M 20 12 C 18 18 9 19 5 14"; label: "Pan"; active: root.pan-active; clicked => { root.options-open-tool = -1; root.choose-pan(); } }
+            }
+        }
+
+        content := Rectangle {
+            vertical-stretch: 1;
+            background: transparent;
+
+            HorizontalLayout {
+                spacing: 0px;
+
+                canvas := Rectangle {
+                    min-width: 280px;
+                    horizontal-stretch: 1;
+                    background: transparent;
+
+                    canvas-touch := TouchArea {
+                        mouse-cursor: root.pan-active ? grab : crosshair;
+                        pointer-event(event) => {
+                            if event.button != PointerEventButton.left {
+                                return;
+                            }
+                            if event.kind == PointerEventKind.down {
+                                root.options-open-tool = -1;
+                                key-scope.focus();
+                                root.canvas-press(self.mouse-x / 1px, self.mouse-y / 1px);
+                            } else if event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel {
+                                root.canvas-release();
+                            }
+                        }
+                        moved => { root.canvas-move(self.mouse-x / 1px, self.mouse-y / 1px); }
+                        double-clicked => {
+                            key-scope.focus();
+                            root.canvas-double-click(self.mouse-x / 1px, self.mouse-y / 1px);
+                        }
+                        scroll-event(event) => {
+                            root.canvas-scroll(self.mouse-x / 1px, self.mouse-y / 1px, event.delta-y / 1px);
+                            accept
+                        }
+                    }
+                }
+
+                if root.ocr-panel-visible: Rectangle {
+                    min-width: 280px;
+                    preferred-width: 320px;
+                    max-width: 360px;
+                    horizontal-stretch: 0;
+                    background: #f4f5f7;
+
+                    Rectangle { width: 1px; height: parent.height; background: #d6d9de; }
+
+                    VerticalLayout {
+                        padding: 12px;
+
+                        TextEdit {
+                            text: root.ocr-text;
+                            read-only: true;
+                            wrap: word-wrap;
+                            font-size: 15px;
+                            accessible-label: "OCR result";
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 28px;
+            background: #202328;
+
+            Text {
+                x: max(0px, root.canvas-width - 92px);
+                width: 80px;
+                height: parent.height;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                color: #b9bec5;
+                text: root.zoom-percent + "%";
+            }
+        }
+    }
+
+    options-popup := Rectangle {
+        property <length> content-preferred-width: root.options-open-tool == 1 || root.options-open-tool == 2
+            ? shape-options.preferred-width
+            : root.options-open-tool == 4 || root.options-open-tool == 5
+                ? stroke-options.preferred-width
+                : root.options-open-tool == 7
+                    ? text-options.preferred-width
+                    : root.options-open-tool == 6
+                        ? mosaic-options.preferred-width
+                        : emotion-options.preferred-width;
+        property <length> content-preferred-height: root.options-open-tool == 1 || root.options-open-tool == 2
+            ? shape-options.preferred-height
+            : root.options-open-tool == 4 || root.options-open-tool == 5
+                ? stroke-options.preferred-height
+                : root.options-open-tool == 7
+                    ? text-options.preferred-height
+                    : root.options-open-tool == 6
+                        ? mosaic-options.preferred-height
+                        : emotion-options.preferred-height;
+
+        visible: root.options-open-tool >= 1;
+        z: 20;
+        y: 60px;
+        width: min(self.content-preferred-width, max(1px, root.width - 8px));
+        height: 7px + self.content-preferred-height;
+        x: max(4px, min(root.width - self.width - 4px,
+            8px + root.popup-visual-index * 32px + 15px - self.width / 2));
+        background: transparent;
+
+        Path {
+            x: max(8px, min(parent.width - 24px,
+                8px + root.popup-visual-index * 32px + 15px - options-popup.x - 8px));
+            y: 0px;
+            width: 16px;
+            height: 8px;
+            viewbox-width: 16;
+            viewbox-height: 8;
+            commands: "M 0 8 L 8 0 L 16 8 Z";
+            fill: #f0f0f0;
+            stroke: #b8bcc2;
+            stroke-width: 1px;
+        }
+
+        Rectangle {
+            y: 7px;
+            width: parent.width;
+            height: parent.height - 7px;
+            border-radius: 4px;
+            background: #f0f0f0;
+            border-width: 1px;
+            border-color: #b8bcc2;
+        }
+
+        shape-options := OptionRow {
+            y: 7px;
+            width: parent.width;
+            height: parent.height - self.y;
+            visible: root.options-open-tool == 1 || root.options-open-tool == 2;
+            values: [2, 4, 8];
+            value-visual-kind: 0;
+            value-label: "Stroke width";
+            value-code-base: 0;
+            active-value: root.active-stroke-width;
+            show-fill: true;
+            fill-active: root.fill-active;
+            colors: root.option-colors;
+            active-color: root.active-color;
+            choose(code) => { root.choose-option(code); }
+        }
+
+        stroke-options := OptionRow {
+            y: 7px;
+            width: parent.width;
+            height: parent.height - self.y;
+            visible: root.options-open-tool == 4 || root.options-open-tool == 5;
+            values: [2, 4, 8];
+            value-visual-kind: 0;
+            value-label: "Stroke width";
+            value-code-base: 0;
+            active-value: root.active-stroke-width;
+            colors: root.option-colors;
+            active-color: root.active-color;
+            choose(code) => { root.choose-option(code); }
+        }
+
+        text-options := OptionRow {
+            y: 7px;
+            width: parent.width;
+            height: parent.height - self.y;
+            visible: root.options-open-tool == 7;
+            values: [12, 20, 32];
+            value-visual-kind: 1;
+            value-label: "Text size";
+            value-code-base: 20;
+            active-value: root.active-text-size;
+            colors: root.option-colors;
+            active-color: root.active-color;
+            choose(code) => { root.choose-option(code); }
+        }
+
+        mosaic-options := OptionRow {
+            y: 7px;
+            width: parent.width;
+            height: parent.height - self.y;
+            visible: root.options-open-tool == 6;
+            values: [10, 16, 24];
+            value-visual-kind: 4;
+            value-label: "Mosaic size";
+            value-code-base: 30;
+            active-value: root.active-mosaic-size;
+            choose(code) => { root.choose-option(code); }
+        }
+
+        emotion-options := EmotionOptions {
+            y: 7px;
+            width: parent.width;
+            height: parent.height - self.y;
+            visible: root.options-open-tool == 3;
+            emotions: root.emotions;
+            active-emotion: root.active-emotion;
+            choose(code) => { root.choose-option(code); }
+        }
+    }
+
+    key-scope := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            root.key-input(event.text, event.modifiers.control, event.modifiers.shift, event.modifiers.alt)
+                ? accept : reject
+        }
+    }
+}

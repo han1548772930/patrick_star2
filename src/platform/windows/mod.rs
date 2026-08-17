@@ -17,16 +17,34 @@ mod slint_window;
 mod wgl;
 mod window_locator;
 
+use std::ptr::{null, null_mut};
 use std::rc::Rc;
 
-use crate::model::{DesktopFrame, RgbaFrame};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+use windows_sys::Win32::Graphics::Gdi::{
+    MONITOR_DEFAULTTONEAREST, MonitorFromPoint, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, RedrawWindow,
+};
+use windows_sys::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+};
+
+use crate::model::{DesktopFrame, PointI, RgbaFrame};
 use crate::ocr::{OcrDocument, OcrLanguage, TextRecognizer};
 use crate::platform::{
     ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, CaptureOverlayResult,
     DesktopCapture, DirectoryPicker, GlobalShortcutHost, GlobalShortcutRegistration,
     ImageClipboard, ImageSaveDialog, ImageSaveTarget, PinnedImageHost, PlatformCapabilities,
     ScrollCaptureSource, ScrollPreview, ScrollPreviewHost, Shortcut, SingleInstanceGuard,
-    SingleInstanceHost, TextClipboard,
+    SingleInstanceHost, TextClipboard, WindowFrame, WindowFrameAnchor, WindowFrameConfig,
+    WindowFrameEvent, WindowFrameHost,
 };
 
 pub struct Backend;
@@ -45,7 +63,89 @@ pub(crate) fn ui_font_paths() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+pub(super) fn set_preview_cursor(
+    window: &slint::Window,
+    cursor: crate::model::PointerCursor,
+    popup: Option<crate::model::Rect>,
+) {
+    slint_window::set_preview_cursor(window, cursor, popup);
+}
+
+pub(super) fn set_slint_window_topmost(window: &slint::Window, topmost: bool) -> anyhow::Result<()> {
+    let persistent = window.window_handle();
+    let borrowed = persistent
+        .window_handle()
+        .map_err(|error| anyhow::anyhow!("Slint window handle is unavailable: {error}"))?;
+    let RawWindowHandle::Win32(handle) = borrowed.as_raw() else {
+        anyhow::bail!("Slint window is not backed by a Win32 HWND");
+    };
+    let insert_after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let changed = unsafe {
+        SetWindowPos(
+            handle.hwnd.get() as _,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    anyhow::ensure!(changed != 0, "SetWindowPos failed while changing topmost state");
+    Ok(())
+}
+
+pub(super) fn refresh_desktop_after_overlay() {
+    unsafe {
+        let desktop = GetDesktopWindow();
+        if !desktop.is_null() {
+            RedrawWindow(
+                desktop,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+        }
+        let _ = DwmFlush();
+    }
+}
+
+pub(super) fn dpi_scale_at(point: PointI, fallback: f32) -> f32 {
+    let monitor = unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: point.x,
+                y: point.y,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    if monitor.is_null() {
+        return fallback;
+    }
+    let mut dpi_x = 0;
+    let mut dpi_y = 0;
+    let result = unsafe {
+        GetDpiForMonitor(
+            monitor,
+            MDT_EFFECTIVE_DPI,
+            &mut dpi_x,
+            &mut dpi_y,
+        )
+    };
+    if result >= 0 && dpi_x > 0 {
+        dpi_x as f32 / 96.0
+    } else {
+        fallback
+    }
+}
+
 pub fn install_slint_platform() -> anyhow::Result<Box<dyn GlobalShortcutHost>> {
+    // DPI awareness is process-wide and must be selected before the tray
+    // backend creates its hidden HWND. Setting it later is rejected by Windows.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let hotkeys = Rc::new(hotkey::Host::new());
     slint::platform::set_platform(Box::new(slint_event_loop::WindowsSlintPlatform::new(
         hotkeys.clone(),
@@ -161,6 +261,75 @@ impl ScrollPreviewHost for Backend {
     }
 }
 
+struct WindowsWindowFrame {
+    _controller: slint_borderless::FrameController,
+}
+
+impl WindowFrame for WindowsWindowFrame {}
+
+impl WindowFrameHost for Backend {
+    fn attach_window_frame(
+        &self,
+        window: &slint::Window,
+        config: WindowFrameConfig,
+        on_event: Box<dyn Fn(WindowFrameEvent) + 'static>,
+    ) -> anyhow::Result<Box<dyn WindowFrame>> {
+        let always_on_top = config.always_on_top;
+        let client_areas = config
+            .client_areas
+            .into_iter()
+            .map(|area| match area.anchor {
+                WindowFrameAnchor::Left => {
+                    slint_borderless::ClientArea::left(area.x, area.y, area.width, area.height)
+                }
+                WindowFrameAnchor::Right => {
+                    slint_borderless::ClientArea::right(area.x, area.y, area.width, area.height)
+                }
+            })
+            .collect();
+        let frame = slint_borderless::FrameController::attach_window(
+            window,
+            slint_borderless::FrameOptions {
+                titlebar_height: config.titlebar_height,
+                caption_button_width: config.caption_button_width,
+                minimum_size: Some(slint_borderless::LogicalSize {
+                    width: config.minimum_width,
+                    height: config.minimum_height,
+                }),
+                rounded_corners: config.rounded_corners,
+                client_areas,
+            },
+        )?;
+        frame.on_event(move |event| {
+            let event = match event {
+                slint_borderless::FrameEvent::Installed => WindowFrameEvent::Installed,
+                slint_borderless::FrameEvent::CaptionHoverChanged(button) => {
+                    WindowFrameEvent::CaptionHoverChanged(button.map(|button| match button {
+                        slint_borderless::CaptionButton::Minimize => {
+                            crate::platform::CaptionButton::Minimize
+                        }
+                        slint_borderless::CaptionButton::Maximize => {
+                            crate::platform::CaptionButton::Maximize
+                        }
+                        slint_borderless::CaptionButton::Close => {
+                            crate::platform::CaptionButton::Close
+                        }
+                    }))
+                }
+                slint_borderless::FrameEvent::Detached => WindowFrameEvent::Detached,
+                slint_borderless::FrameEvent::Failed(error) => {
+                    WindowFrameEvent::Failed(error.to_string())
+                }
+            };
+            on_event(event);
+        });
+        if always_on_top {
+            set_slint_window_topmost(window, true)?;
+        }
+        Ok(Box::new(WindowsWindowFrame { _controller: frame }))
+    }
+}
+
 impl PlatformCapabilities for Backend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -176,6 +345,7 @@ impl PlatformCapabilities for Backend {
             global_shortcut: Availability::Native,
             tray: Availability::Native,
             capture_exclusion: Availability::Native,
+            window_frame: Availability::Native,
         }
     }
 }

@@ -115,6 +115,7 @@ impl PlatformCapabilities for Backend {
             global_shortcut: Availability::Unavailable,
             tray: Availability::Unavailable,
             capture_exclusion: Availability::Unavailable,
+            window_frame: Availability::Unavailable,
         }
     }
 }

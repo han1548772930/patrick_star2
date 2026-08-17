@@ -145,9 +145,10 @@ impl Annotation {
 
     pub fn visual_bounds(&self) -> Rect {
         match self.kind {
-            // Emotion glyphs do not use the annotation stroke. Inflating by
-            // its width makes the selection frame disagree with the grips.
-            AnnotationKind::Emotion { .. } => self.bounds(),
+            // Text and emotion glyphs do not use the annotation stroke.
+            // Inflating by its width makes their selection frame disagree
+            // with the editor's grips, especially while text is being typed.
+            AnnotationKind::Text { .. } | AnnotationKind::Emotion { .. } => self.bounds(),
             _ => self.bounds().inflated(self.stroke.width * 0.5 + 1.0),
         }
     }
@@ -419,6 +420,21 @@ mod tests {
         );
         assert_ne!(bottom, top);
         assert_eq!(document.hit_test(Point::new(0.0, 50.0)), Some(top));
+    }
+
+    #[test]
+    fn text_visual_frame_is_not_inflated_by_shape_stroke() {
+        let annotation = Annotation {
+            id: AnnotationId(0),
+            kind: AnnotationKind::Text {
+                origin: Point::new(20.0, 30.0),
+                content: "text".to_owned(),
+                style: TextStyle::default(),
+            },
+            stroke: Stroke::new(Rgba::BLACK, 10.0),
+        };
+
+        assert_eq!(annotation.visual_bounds(), annotation.bounds());
     }
 
     #[test]

@@ -4,11 +4,17 @@ use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
 use slint::platform::Key;
-use slint::{CloseRequestResponse, ComponentHandle, GraphicsAPI, RenderingState, SharedString};
+use slint::{
+    CloseRequestResponse, ComponentHandle, GraphicsAPI, ModelRc, RenderingState, SharedString,
+    VecModel,
+};
 
-use crate::model::preview::{PreviewMode, PreviewSession};
-use crate::model::{EditorKey, Point, RgbaFrame, Tool};
-use crate::platform::{ImageClipboard, ImageSaveDialog};
+use crate::model::preview::{PREVIEW_TITLEBAR_HEIGHT, PreviewMode, PreviewSession};
+use crate::model::{EMOTIONS, EditorKey, OverlayOption, Point, Rect, RgbaFrame, Tool};
+use crate::platform::{
+    ImageClipboard, ImageSaveDialog, WindowFrame, WindowFrameClientArea, WindowFrameConfig,
+    WindowFrameEvent, WindowFrameHost,
+};
 use crate::rendering::PreviewRenderer;
 use crate::ui::PreviewWindow;
 
@@ -20,6 +26,11 @@ thread_local! {
 enum OutputRequest {
     Copy,
     Save,
+}
+
+#[derive(Default)]
+struct PreviewFrameState {
+    handle: Option<Box<dyn WindowFrame>>,
 }
 
 pub(super) fn open(image: RgbaFrame, save_directory: Option<PathBuf>) -> Result<()> {
@@ -40,6 +51,12 @@ fn open_window(
     save_directory: Option<PathBuf>,
 ) -> Result<()> {
     let window = PreviewWindow::new()?;
+    let emotions = EMOTIONS
+        .iter()
+        .copied()
+        .map(SharedString::from)
+        .collect::<Vec<_>>();
+    window.set_emotions(ModelRc::new(VecModel::from(emotions)));
     if let Some(text) = recognized_text {
         window.set_preview_title("截图预览".into());
         window.set_ocr_text(text.into());
@@ -47,12 +64,14 @@ fn open_window(
     }
     let session = Rc::new(RefCell::new(PreviewSession::new(image)));
     let renderer = Rc::new(RefCell::new(None::<PreviewRenderer>));
+    let frame = Rc::new(RefCell::new(PreviewFrameState::default()));
     let pending_output = Rc::new(Cell::new(None::<OutputRequest>));
 
     install_rendering_notifier(
         &window,
         session.clone(),
         renderer,
+        frame,
         pending_output.clone(),
         save_directory,
     )?;
@@ -75,6 +94,7 @@ fn install_rendering_notifier(
     window: &PreviewWindow,
     session: Rc<RefCell<PreviewSession>>,
     renderer: Rc<RefCell<Option<PreviewRenderer>>>,
+    frame: Rc<RefCell<PreviewFrameState>>,
     pending_output: Rc<Cell<Option<OutputRequest>>>,
     save_directory: Option<PathBuf>,
 ) -> Result<()> {
@@ -83,6 +103,15 @@ fn install_rendering_notifier(
         .window()
         .set_rendering_notifier(move |state, graphics| match state {
             RenderingState::RenderingSetup => {
+                let Some(component) = weak.upgrade() else {
+                    return;
+                };
+                if frame.borrow().handle.is_none() {
+                    match attach_preview_frame(&component) {
+                        Ok(handle) => frame.borrow_mut().handle = Some(handle),
+                        Err(error) => eprintln!("attach preview window frame failed: {error:#}"),
+                    }
+                }
                 let GraphicsAPI::NativeOpenGL { get_proc_address } = graphics else {
                     eprintln!("preview requires the native OpenGL Slint renderer");
                     return;
@@ -139,6 +168,39 @@ fn install_rendering_notifier(
     Ok(())
 }
 
+fn attach_preview_frame(window: &PreviewWindow) -> Result<Box<dyn WindowFrame>> {
+    let weak = window.as_weak();
+    crate::platform::current().attach_window_frame(
+        window.window(),
+        WindowFrameConfig {
+            // slint-borderless owns the first row's caption buttons. The
+            // native Slint window procedure extends dragging through row two
+            // while preserving both rows' command rectangles as client input.
+            titlebar_height: PREVIEW_TITLEBAR_HEIGHT,
+            caption_button_width: 48.0,
+            minimum_width: 560.0,
+            minimum_height: 200.0,
+            rounded_corners: true,
+            always_on_top: false,
+            client_areas: vec![
+                WindowFrameClientArea::left(0.0, 0.0, 240.0, 30.0),
+                WindowFrameClientArea::right(144.0, 0.0, 64.0, 30.0),
+            ],
+        },
+        Box::new(move |event| match event {
+            WindowFrameEvent::CaptionHoverChanged(button) => {
+                if let Some(window) = weak.upgrade() {
+                    window.set_caption_hover(crate::ui::caption_button_value(button));
+                }
+            }
+            WindowFrameEvent::Failed(error) => {
+                eprintln!("preview window frame failed: {error}");
+            }
+            WindowFrameEvent::Installed | WindowFrameEvent::Detached => {}
+        }),
+    )
+}
+
 fn dispatch_output(request: OutputRequest, image: RgbaFrame, save_directory: Option<PathBuf>) {
     let result = slint::invoke_from_event_loop(move || {
         let backend = crate::platform::current();
@@ -172,6 +234,15 @@ fn bind_commands(
             return;
         };
         mutate_and_redraw(&weak, &state, |session| session.set_tool(tool));
+    });
+
+    let weak = window.as_weak();
+    let state = session.clone();
+    window.on_choose_option(move |code| {
+        let Some(option) = option_from_code(code) else {
+            return;
+        };
+        mutate_and_redraw(&weak, &state, |session| session.activate_option(option));
     });
 
     let weak = window.as_weak();
@@ -287,28 +358,6 @@ fn bind_commands(
             window.window().request_redraw();
         }
     });
-
-    let weak = window.as_weak();
-    window.on_minimize(move || {
-        if let Some(window) = weak.upgrade() {
-            window.window().set_minimized(true);
-        }
-    });
-
-    let weak = window.as_weak();
-    window.on_toggle_maximize(move || {
-        if let Some(window) = weak.upgrade() {
-            let maximized = window.window().is_maximized();
-            window.window().set_maximized(!maximized);
-        }
-    });
-
-    let weak = window.as_weak();
-    window.on_request_close(move || {
-        if let Some(window) = weak.upgrade() {
-            let _ = window.hide();
-        }
-    });
 }
 
 fn mutate_and_redraw(
@@ -330,6 +379,37 @@ fn sync_ui(window: &PreviewWindow, session: &PreviewSession) {
     window.set_can_undo(session.editor().can_undo());
     window.set_can_redo(session.editor().can_redo());
     window.set_zoom_percent((session.view().zoom() * 100.0).round() as i32);
+    window.set_active_stroke_width(active_option_index(session, 3, OverlayOption::StrokeWidth));
+    window.set_fill_active(session.option_active(OverlayOption::ToggleFill));
+    window.set_active_color(active_option_index(session, 7, OverlayOption::Color));
+    window.set_active_text_size(active_option_index(session, 3, OverlayOption::TextSize));
+    window.set_active_mosaic_size(active_option_index(session, 3, OverlayOption::MosaicBlock));
+    window.set_active_emotion(active_option_index(
+        session,
+        u8::try_from(EMOTIONS.len()).unwrap_or(u8::MAX),
+        OverlayOption::Emotion,
+    ));
+    let popup = window.get_options_popup_visible().then(|| {
+        let left = window.get_options_popup_x();
+        let top = window.get_options_popup_y();
+        Rect::new(
+            left,
+            top,
+            left + window.get_options_popup_width(),
+            top + window.get_options_popup_height(),
+        )
+    });
+    crate::platform::set_preview_cursor(window.window(), session.pointer_cursor(), popup);
+}
+
+fn active_option_index(
+    session: &PreviewSession,
+    count: u8,
+    option: impl Fn(u8) -> OverlayOption,
+) -> i32 {
+    (0..count)
+        .find(|index| session.option_active(option(*index)))
+        .map_or(-1, i32::from)
 }
 
 fn handle_key(
@@ -403,4 +483,20 @@ fn tool_index(tool: Tool) -> i32 {
         Tool::Mosaic => 6,
         Tool::Text => 7,
     }
+}
+
+fn option_from_code(code: i32) -> Option<OverlayOption> {
+    Some(match code {
+        0..=2 => OverlayOption::StrokeWidth(code as u8),
+        3 => OverlayOption::ToggleFill,
+        10..=16 => OverlayOption::Color((code - 10) as u8),
+        20..=22 => OverlayOption::TextSize((code - 20) as u8),
+        30..=32 => OverlayOption::MosaicBlock((code - 30) as u8),
+        40.. => {
+            let index = u8::try_from(code - 40).ok()?;
+            EMOTIONS.get(usize::from(index))?;
+            OverlayOption::Emotion(index)
+        }
+        _ => return None,
+    })
 }

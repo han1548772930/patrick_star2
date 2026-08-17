@@ -8,7 +8,8 @@ use crate::platform::{
     ActiveScrollCapture, Availability, Capabilities, CaptureOverlay, CaptureOverlayResult,
     DesktopCapture, DirectoryPicker, ImageClipboard, ImageSaveDialog, ImageSaveTarget,
     PinnedImageHost, PlatformCapabilities, ScrollCaptureSource, ScrollPreview, ScrollPreviewHost,
-    SingleInstanceGuard, SingleInstanceHost, TextClipboard,
+    SingleInstanceGuard, SingleInstanceHost, TextClipboard, WindowFrame, WindowFrameConfig,
+    WindowFrameEvent, WindowFrameHost,
 };
 
 pub struct Backend;
@@ -108,6 +109,17 @@ impl ScrollPreviewHost for Backend {
     }
 }
 
+impl WindowFrameHost for Backend {
+    fn attach_window_frame(
+        &self,
+        _window: &slint::Window,
+        _config: WindowFrameConfig,
+        _on_event: Box<dyn Fn(WindowFrameEvent) + 'static>,
+    ) -> anyhow::Result<Box<dyn WindowFrame>> {
+        anyhow::bail!("macOS native Slint window frame is not implemented yet")
+    }
+}
+
 impl PlatformCapabilities for Backend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -123,6 +135,7 @@ impl PlatformCapabilities for Backend {
             global_shortcut: Availability::Unavailable,
             tray: Availability::Unavailable,
             capture_exclusion: Availability::Unavailable,
+            window_frame: Availability::Unavailable,
         }
     }
 }

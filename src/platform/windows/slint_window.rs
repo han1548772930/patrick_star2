@@ -2,10 +2,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::mem::{ManuallyDrop, size_of, zeroed};
+use std::num::NonZeroIsize;
 use std::num::NonZeroU32;
 use std::ptr::{null, null_mut};
 use std::rc::{Rc, Weak};
 
+use raw_window_handle::{
+    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
+};
 use slint::platform::femtovg_renderer::{FemtoVGRenderer, OpenGLInterface};
 use slint::platform::{
     Key, LayoutConstraints, PlatformError, PointerEventButton, Renderer, WindowAdapter,
@@ -22,8 +26,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
-    GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
+    GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture, SetCapture, TME_LEAVE,
@@ -36,8 +39,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CS_OWNDC, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, HTBOTTOM,
     HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
-    HTTOPRIGHT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IsIconic, IsWindow, IsZoomed,
-    LoadCursorW, MINMAXINFO, RegisterClassExW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE,
+    HTTOPRIGHT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsIconic, IsWindow, IsZoomed, LoadCursorW, MINMAXINFO,
+    RegisterClassExW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE,
     SIZE_MINIMIZED, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE,
     SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, UNICODE_NOCHAR,
@@ -54,6 +58,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::model::preview::{
     PREVIEW_HEADER_HEIGHT, PREVIEW_STATUS_HEIGHT, PREVIEW_TITLEBAR_HEIGHT,
 };
+use crate::model::{PointerCursor, Rect};
 
 use super::{capture_exclusion, wgl};
 
@@ -69,7 +74,9 @@ const TITLEBAR_LOGICAL_HEIGHT: f32 = 36.0;
 const TITLEBAR_BUTTONS_LOGICAL_WIDTH: f32 = 44.0;
 const PREVIEW_LEFT_COMMANDS_LOGICAL_WIDTH: f32 = 240.0;
 const PREVIEW_RIGHT_COMMANDS_LOGICAL_WIDTH: f32 = 216.0;
-const PREVIEW_DRAWING_COMMANDS_LOGICAL_WIDTH: f32 = 340.0;
+const PREVIEW_DRAWING_COMMANDS_LOGICAL_WIDTH: f32 = 300.0;
+const PIN_LEFT_COMMANDS_LOGICAL_WIDTH: f32 = 38.0;
+const PIN_RIGHT_COMMANDS_LOGICAL_WIDTH: f32 = 144.0;
 const OCR_PANEL_MIN_LOGICAL_WIDTH: f32 = 280.0;
 const OCR_PANEL_MAX_LOGICAL_WIDTH: f32 = 360.0;
 const WHEEL_LOGICAL_PIXELS_PER_NOTCH: f32 = 60.0;
@@ -83,9 +90,6 @@ const MK_XBUTTON2: u32 = 0x0040;
 const XBUTTON_MASK: u32 = MK_XBUTTON1 | MK_XBUTTON2;
 
 pub(crate) fn create() -> Result<Rc<dyn WindowAdapter>, PlatformError> {
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
     register_window_class()?;
 
     let initial_dpi = system_dpi();
@@ -168,6 +172,8 @@ pub(crate) fn create() -> Result<Rc<dyn WindowAdapter>, PlatformError> {
             preferred_size_applied: Cell::new(false),
             constraints: Cell::new(LayoutConstraints::default()),
             content_kind: Cell::new(WindowContentKind::Other),
+            preview_canvas_cursor: Cell::new(ClientCursor::Arrow),
+            preview_popup: Cell::new(None),
             character_keys: RefCell::new(HashMap::new()),
             pending_high_surrogate: Cell::new(None),
             render_error: RefCell::new(None),
@@ -193,6 +199,34 @@ pub(crate) fn create() -> Result<Rc<dyn WindowAdapter>, PlatformError> {
         scale_factor: adapter.scale_factor(),
     });
     Ok(adapter)
+}
+
+pub(super) fn set_preview_cursor(
+    window: &slint::Window,
+    cursor: PointerCursor,
+    popup: Option<Rect>,
+) {
+    let persistent = window.window_handle();
+    let Ok(borrowed) = persistent.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = borrowed.as_raw() else {
+        return;
+    };
+    let hwnd = handle.hwnd.get() as HWND;
+    let adapter = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const NativeWindow;
+    if adapter.is_null() {
+        return;
+    }
+    let adapter = unsafe { &*adapter };
+    if adapter.hwnd != hwnd {
+        return;
+    }
+    adapter.preview_canvas_cursor.set(cursor.into());
+    adapter.preview_popup.set(popup);
+    if adapter.visible.get() {
+        adapter.apply_client_cursor();
+    }
 }
 
 fn register_window_class() -> Result<(), PlatformError> {
@@ -255,6 +289,8 @@ struct NativeWindow {
     preferred_size_applied: Cell<bool>,
     constraints: Cell<LayoutConstraints>,
     content_kind: Cell<WindowContentKind>,
+    preview_canvas_cursor: Cell<ClientCursor>,
+    preview_popup: Cell<Option<Rect>>,
     character_keys: RefCell<HashMap<u32, SharedString>>,
     pending_high_surrogate: Cell<Option<u16>>,
     render_error: RefCell<Option<String>>,
@@ -496,8 +532,15 @@ impl NativeWindow {
             point.x,
             point.y,
             self.scale_factor(),
+            self.preview_canvas_cursor.get(),
+            self.preview_popup.get(),
         );
-        unsafe { SetCursor(LoadCursorW(null_mut(), cursor.resource())) };
+        unsafe {
+            let handle = cursor
+                .resource()
+                .map_or(null_mut(), |resource| LoadCursorW(null_mut(), resource));
+            SetCursor(handle);
+        }
     }
 
     fn apply_min_max_constraints(&self, lparam: LPARAM) {
@@ -605,6 +648,12 @@ impl WindowAdapter for NativeWindow {
 
     fn renderer(&self) -> &dyn Renderer {
         &*self.renderer
+    }
+
+    fn window_handle_06(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let hwnd = NonZeroIsize::new(self.hwnd as isize).ok_or(HandleError::Unavailable)?;
+        let handle = Win32WindowHandle::new(hwnd);
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(handle)) })
     }
 
     fn update_window_properties(&self, properties: WindowProperties<'_>) {
@@ -911,13 +960,7 @@ fn hit_test_region(
         (_, true, _, _) => HTRIGHT,
         (_, _, true, _) => HTTOP,
         (_, _, _, true) => HTBOTTOM,
-        _ if x >= titlebar.drag_left
-            && x < (width - titlebar.drag_right).max(titlebar.drag_left)
-            && y >= 0
-            && y < titlebar.height =>
-        {
-            HTCAPTION
-        }
+        _ if titlebar.is_drag_region(width, x, y) => HTCAPTION,
         _ => HTCLIENT,
     }
 }
@@ -925,27 +968,64 @@ fn hit_test_region(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TitlebarHitLayout {
     height: i32,
-    drag_left: i32,
-    drag_right: i32,
+    first_row_height: i32,
+    first_drag_left: i32,
+    first_drag_right: i32,
+    second_drag_left: i32,
+    second_drag_right: i32,
+}
+
+impl TitlebarHitLayout {
+    fn drag_bounds(self, y: i32) -> Option<(i32, i32)> {
+        if y < 0 || y >= self.height {
+            None
+        } else if y < self.first_row_height {
+            Some((self.first_drag_left, self.first_drag_right))
+        } else {
+            Some((self.second_drag_left, self.second_drag_right))
+        }
+    }
+
+    fn is_drag_region(self, width: i32, x: i32, y: i32) -> bool {
+        self.drag_bounds(y)
+            .is_some_and(|(left, right)| x >= left && x < (width - right).max(left))
+    }
 }
 
 fn titlebar_hit_layout(kind: WindowContentKind, scale_factor: f32) -> TitlebarHitLayout {
-    let (height, drag_left, drag_right) = match kind {
+    let (height, first_height, first_left, first_right, second_left, second_right) = match kind {
         WindowContentKind::Preview | WindowContentKind::OcrPreview => (
+            PREVIEW_HEADER_HEIGHT,
             PREVIEW_TITLEBAR_HEIGHT,
             PREVIEW_LEFT_COMMANDS_LOGICAL_WIDTH,
             PREVIEW_RIGHT_COMMANDS_LOGICAL_WIDTH,
+            PREVIEW_DRAWING_COMMANDS_LOGICAL_WIDTH,
+            0.0,
         ),
-        WindowContentKind::Other => (TITLEBAR_LOGICAL_HEIGHT, 0.0, TITLEBAR_BUTTONS_LOGICAL_WIDTH),
+        WindowContentKind::Pin => (
+            PREVIEW_TITLEBAR_HEIGHT,
+            PREVIEW_TITLEBAR_HEIGHT,
+            PIN_LEFT_COMMANDS_LOGICAL_WIDTH,
+            PIN_RIGHT_COMMANDS_LOGICAL_WIDTH,
+            PIN_LEFT_COMMANDS_LOGICAL_WIDTH,
+            PIN_RIGHT_COMMANDS_LOGICAL_WIDTH,
+        ),
+        WindowContentKind::Other => (
+            TITLEBAR_LOGICAL_HEIGHT,
+            TITLEBAR_LOGICAL_HEIGHT,
+            0.0,
+            TITLEBAR_BUTTONS_LOGICAL_WIDTH,
+            0.0,
+            TITLEBAR_BUTTONS_LOGICAL_WIDTH,
+        ),
     };
     TitlebarHitLayout {
         height: logical_length_to_physical(height, scale_factor),
-        drag_left: if drag_left == 0.0 {
-            0
-        } else {
-            logical_length_to_physical(drag_left, scale_factor)
-        },
-        drag_right: logical_length_to_physical(drag_right, scale_factor),
+        first_row_height: logical_length_to_physical(first_height, scale_factor),
+        first_drag_left: logical_or_zero(first_left, scale_factor),
+        first_drag_right: logical_or_zero(first_right, scale_factor),
+        second_drag_left: logical_or_zero(second_left, scale_factor),
+        second_drag_right: logical_or_zero(second_right, scale_factor),
     }
 }
 
@@ -960,6 +1040,7 @@ enum WindowContentKind {
     Other,
     Preview,
     OcrPreview,
+    Pin,
 }
 
 impl WindowContentKind {
@@ -967,6 +1048,7 @@ impl WindowContentKind {
         match title {
             "Patrick Star" => Self::Preview,
             "截图预览" => Self::OcrPreview,
+            "Patrick Star Pin" => Self::Pin,
             _ => Self::Other,
         }
     }
@@ -978,15 +1060,47 @@ enum ClientCursor {
     Hand,
     Crosshair,
     Text,
+    Move,
+    ResizeNorthSouth,
+    ResizeEastWest,
+    ResizeNorthEastSouthWest,
+    ResizeNorthWestSouthEast,
+    NotAllowed,
+    Hidden,
 }
 
 impl ClientCursor {
-    const fn resource(self) -> windows_sys::core::PCWSTR {
+    const fn resource(self) -> Option<windows_sys::core::PCWSTR> {
         match self {
-            Self::Arrow => IDC_ARROW,
-            Self::Hand => IDC_HAND,
-            Self::Crosshair => IDC_CROSS,
-            Self::Text => IDC_IBEAM,
+            Self::Arrow => Some(IDC_ARROW),
+            Self::Hand => Some(IDC_HAND),
+            Self::Crosshair => Some(IDC_CROSS),
+            Self::Text => Some(IDC_IBEAM),
+            Self::Move => Some(IDC_SIZEALL),
+            Self::ResizeNorthSouth => Some(IDC_SIZENS),
+            Self::ResizeEastWest => Some(IDC_SIZEWE),
+            Self::ResizeNorthEastSouthWest => Some(IDC_SIZENESW),
+            Self::ResizeNorthWestSouthEast => Some(IDC_SIZENWSE),
+            Self::NotAllowed => Some(IDC_NO),
+            Self::Hidden => None,
+        }
+    }
+}
+
+impl From<PointerCursor> for ClientCursor {
+    fn from(cursor: PointerCursor) -> Self {
+        match cursor {
+            PointerCursor::Arrow => Self::Arrow,
+            PointerCursor::Crosshair => Self::Crosshair,
+            PointerCursor::Hand => Self::Hand,
+            PointerCursor::IBeam => Self::Text,
+            PointerCursor::Move | PointerCursor::Grab | PointerCursor::Grabbing => Self::Move,
+            PointerCursor::ResizeNorthSouth => Self::ResizeNorthSouth,
+            PointerCursor::ResizeEastWest => Self::ResizeEastWest,
+            PointerCursor::ResizeNorthEastSouthWest => Self::ResizeNorthEastSouthWest,
+            PointerCursor::ResizeNorthWestSouthEast => Self::ResizeNorthWestSouthEast,
+            PointerCursor::NotAllowed => Self::NotAllowed,
+            PointerCursor::Hidden => Self::Hidden,
         }
     }
 }
@@ -998,13 +1112,16 @@ fn client_cursor(
     x: i32,
     y: i32,
     scale_factor: f32,
+    canvas_cursor: ClientCursor,
+    popup: Option<Rect>,
 ) -> ClientCursor {
     if x < 0 || y < 0 || x >= width || y >= height {
         return ClientCursor::Arrow;
     }
     let titlebar = titlebar_hit_layout(kind, scale_factor);
     if y < titlebar.height {
-        return if x < titlebar.drag_left || x >= (width - titlebar.drag_right).max(0) {
+        let (drag_left, drag_right) = titlebar.drag_bounds(y).unwrap_or_default();
+        return if x < drag_left || x >= (width - drag_right).max(0) {
             ClientCursor::Hand
         } else {
             ClientCursor::Arrow
@@ -1015,6 +1132,15 @@ fn client_cursor(
         WindowContentKind::Preview | WindowContentKind::OcrPreview
     ) {
         return ClientCursor::Arrow;
+    }
+
+    if popup.is_some_and(|popup| {
+        let scale = scale_factor.max(0.01);
+        let x = x as f32 / scale;
+        let y = y as f32 / scale;
+        x >= popup.left && x < popup.right && y >= popup.top && y < popup.bottom
+    }) {
+        return ClientCursor::Hand;
     }
 
     let header_height = logical_length_to_physical(PREVIEW_HEADER_HEIGHT, scale_factor);
@@ -1040,7 +1166,7 @@ fn client_cursor(
             return ClientCursor::Text;
         }
     }
-    ClientCursor::Crosshair
+    canvas_cursor
 }
 
 fn client_size(hwnd: HWND) -> Option<PhysicalSize> {
@@ -1072,6 +1198,14 @@ fn logical_length_to_physical(length: f32, scale_factor: f32) -> i32 {
     (length.max(1.0) * scale_factor)
         .round()
         .clamp(1.0, i32::MAX as f32) as i32
+}
+
+fn logical_or_zero(length: f32, scale_factor: f32) -> i32 {
+    if length == 0.0 {
+        0
+    } else {
+        logical_length_to_physical(length, scale_factor)
+    }
 }
 
 fn low_word(value: LPARAM) -> u32 {
@@ -1118,6 +1252,26 @@ mod tests {
         titlebar_hit_layout(WindowContentKind::Preview, 1.0)
     }
 
+    fn preview_client_cursor(
+        kind: WindowContentKind,
+        width: i32,
+        height: i32,
+        x: i32,
+        y: i32,
+        scale: f32,
+    ) -> ClientCursor {
+        client_cursor(
+            kind,
+            width,
+            height,
+            x,
+            y,
+            scale,
+            ClientCursor::Crosshair,
+            None,
+        )
+    }
+
     #[test]
     fn logical_lengths_follow_dpi_scale() {
         assert_eq!(logical_length_to_physical(100.0, 1.0), 100);
@@ -1138,6 +1292,9 @@ mod tests {
         let titlebar = preview_titlebar();
         assert_eq!(hit_test_region(1080, 720, 100, 20, 8, titlebar), HTCLIENT);
         assert_eq!(hit_test_region(1080, 720, 1000, 20, 8, titlebar), HTCLIENT);
+        assert_eq!(hit_test_region(1080, 720, 200, 45, 8, titlebar), HTCLIENT);
+        assert_eq!(hit_test_region(1080, 720, 500, 45, 8, titlebar), HTCAPTION);
+        assert_eq!(hit_test_region(1080, 720, 1000, 45, 8, titlebar), HTCAPTION);
         assert_eq!(hit_test_region(1080, 720, 500, 100, 8, titlebar), HTCLIENT);
     }
 
@@ -1145,27 +1302,27 @@ mod tests {
     fn ocr_preview_uses_native_cursors_for_commands_canvas_and_text() {
         let kind = WindowContentKind::OcrPreview;
         assert_eq!(
-            client_cursor(kind, 1080, 720, 1000, 20, 1.0),
+            preview_client_cursor(kind, 1080, 720, 1000, 20, 1.0),
             ClientCursor::Hand
         );
         assert_eq!(
-            client_cursor(kind, 1080, 720, 200, 45, 1.0),
+            preview_client_cursor(kind, 1080, 720, 200, 45, 1.0),
             ClientCursor::Hand
         );
         assert_eq!(
-            client_cursor(kind, 1080, 720, 500, 20, 1.0),
+            preview_client_cursor(kind, 1080, 720, 500, 20, 1.0),
             ClientCursor::Arrow
         );
         assert_eq!(
-            client_cursor(kind, 1080, 720, 400, 300, 1.0),
+            preview_client_cursor(kind, 1080, 720, 400, 300, 1.0),
             ClientCursor::Crosshair
         );
         assert_eq!(
-            client_cursor(kind, 1080, 720, 900, 300, 1.0),
+            preview_client_cursor(kind, 1080, 720, 900, 300, 1.0),
             ClientCursor::Text
         );
         assert_eq!(
-            client_cursor(kind, 1080, 720, 900, 710, 1.0),
+            preview_client_cursor(kind, 1080, 720, 900, 710, 1.0),
             ClientCursor::Arrow
         );
     }
@@ -1174,13 +1331,54 @@ mod tests {
     fn ocr_cursor_regions_scale_with_window_dpi() {
         let kind = WindowContentKind::OcrPreview;
         assert_eq!(
-            client_cursor(kind, 1620, 1080, 300, 70, 1.5),
+            preview_client_cursor(kind, 1620, 1080, 300, 70, 1.5),
             ClientCursor::Hand
         );
         assert_eq!(
-            client_cursor(kind, 1620, 1080, 1350, 450, 1.5),
+            preview_client_cursor(kind, 1620, 1080, 1350, 450, 1.5),
             ClientCursor::Text
         );
+    }
+
+    #[test]
+    fn popup_and_dynamic_canvas_cursor_override_static_canvas_guessing() {
+        let popup = Rect::new(120.0, 60.0, 360.0, 104.0);
+        assert_eq!(
+            client_cursor(
+                WindowContentKind::Preview,
+                1080,
+                720,
+                180,
+                80,
+                1.0,
+                ClientCursor::Text,
+                Some(popup),
+            ),
+            ClientCursor::Hand
+        );
+        assert_eq!(
+            client_cursor(
+                WindowContentKind::Preview,
+                1080,
+                720,
+                500,
+                300,
+                1.0,
+                ClientCursor::Text,
+                Some(popup),
+            ),
+            ClientCursor::Text
+        );
+    }
+
+    #[test]
+    fn pin_uses_one_compact_titlebar_row() {
+        let titlebar = titlebar_hit_layout(WindowContentKind::Pin, 1.0);
+        assert_eq!(titlebar.height, 30);
+        assert_eq!(hit_test_region(480, 360, 20, 15, 8, titlebar), HTCLIENT);
+        assert_eq!(hit_test_region(480, 360, 200, 15, 8, titlebar), HTCAPTION);
+        assert_eq!(hit_test_region(480, 360, 450, 15, 8, titlebar), HTCLIENT);
+        assert_eq!(hit_test_region(480, 360, 200, 45, 8, titlebar), HTCLIENT);
     }
 
     #[test]

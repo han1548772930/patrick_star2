@@ -12,19 +12,19 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetSystemMetrics,
-    GetWindowLongPtrW, IDC_ARROW, IsWindow, LoadCursorW, RegisterClassExW, SM_CXVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SetWindowLongPtrW, ShowWindow, WM_CLOSE,
-    WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW,
+    HWND_TOPMOST, IDC_ARROW, IsWindow, LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_SIZE, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::model::{DesktopFrame, RgbaFrame};
+use crate::model::{DesktopFrame, RectI, RgbaFrame};
 use crate::platform::ScrollPreview;
 use crate::rendering::ScrollPreviewRenderer;
 use crate::scroll::{PreviewPatch, PreviewRegion};
 
-use super::{capture_exclusion, scroll_overlay, wgl};
+use super::{capture_exclusion, refresh_desktop_after_overlay, scroll_overlay, wgl};
 
 const CLASS_NAME: &[u16] = &[
     'P' as u16, 'a' as u16, 't' as u16, 'r' as u16, 'i' as u16, 'c' as u16, 'k' as u16, 'S' as u16,
@@ -37,50 +37,126 @@ const PREVIEW_WIDTH: i32 = 280;
 const PREVIEW_GAP: i32 = 12;
 
 pub fn open(desktop: &DesktopFrame, initial: &RgbaFrame) -> Result<Box<dyn ScrollPreview>> {
-    let overlay = scroll_overlay::open(desktop, initial.bounds())?;
-    let right = open_right(initial)?;
-    Ok(Box::new(WindowsScrollPreview { overlay, right }))
+    let geometry = right_preview_geometry(desktop, initial)?;
+    let overlay = scroll_overlay::open(desktop, initial.bounds(), geometry.bounds)?;
+    let right = match open_right(initial, geometry) {
+        Ok(right) => right,
+        Err(error) => {
+            drop(overlay);
+            refresh_desktop_after_overlay();
+            return Err(error);
+        }
+    };
+    Ok(Box::new(WindowsScrollPreview {
+        overlay: Some(overlay),
+        right: Some(right),
+    }))
 }
 
 struct WindowsScrollPreview {
-    overlay: Box<scroll_overlay::Window>,
-    right: Box<RightPreview>,
+    overlay: Option<Box<scroll_overlay::Window>>,
+    right: Option<Box<RightPreview>>,
 }
 
 impl ScrollPreview for WindowsScrollPreview {
     fn update(&mut self, patch: PreviewPatch<'_>) -> Result<()> {
-        self.right.update(patch)
+        self.right
+            .as_mut()
+            .context("scroll preview is closed")?
+            .update(patch)
     }
 }
 
 impl Drop for WindowsScrollPreview {
     fn drop(&mut self) {
         unsafe { ReleaseCapture() };
-        let overlay_was_visible = self.overlay.hide_for_close();
-        let preview_was_visible = self.right.hide_for_close();
+        let overlay_was_visible = self
+            .overlay
+            .as_mut()
+            .is_some_and(|overlay| overlay.hide_for_close());
+        let preview_was_visible = self
+            .right
+            .as_mut()
+            .is_some_and(|preview| preview.hide_for_close());
         if overlay_was_visible || preview_was_visible {
             unsafe {
                 let _ = DwmFlush();
             }
         }
+        self.overlay.take();
+        self.right.take();
+        refresh_desktop_after_overlay();
     }
 }
 
-fn open_right(initial: &RgbaFrame) -> Result<Box<RightPreview>> {
-    register_class()?;
-    let bounds = initial.bounds();
-    let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let virtual_right = virtual_left + unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let preferred_right = bounds.right().saturating_add(PREVIEW_GAP);
-    let left = if preferred_right.saturating_add(PREVIEW_WIDTH) <= virtual_right {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RightPreviewGeometry {
+    bounds: RectI,
+    bottom_anchor: i32,
+    maximum_height: u32,
+}
+
+fn right_preview_geometry(
+    desktop: &DesktopFrame,
+    initial: &RgbaFrame,
+) -> Result<RightPreviewGeometry> {
+    let selection = initial.bounds();
+    let desktop_bounds = desktop.bounds;
+    let desktop_width = i32::try_from(desktop_bounds.width())
+        .context("virtual desktop width exceeds i32")?
+        .max(1);
+    let desktop_height = i32::try_from(desktop_bounds.height())
+        .context("virtual desktop height exceeds i32")?
+        .max(1);
+    let preview_width = PREVIEW_WIDTH.min(desktop_width);
+    let preferred_right = selection.right().saturating_add(PREVIEW_GAP);
+    let left = if preferred_right.saturating_add(preview_width) <= desktop_bounds.right() {
         preferred_right
     } else {
-        bounds.left.saturating_sub(PREVIEW_WIDTH + PREVIEW_GAP)
+        selection.left.saturating_sub(preview_width + PREVIEW_GAP)
     }
-    .max(virtual_left);
-    let height = i32::try_from(bounds.height())
-        .context("scroll preview height exceeds i32")?
-        .clamp(240, 720);
+    .clamp(
+        desktop_bounds.left,
+        desktop_bounds.right().saturating_sub(preview_width),
+    );
+    let top_limit = desktop_bounds
+        .top
+        .saturating_add(PREVIEW_GAP.min(desktop_height / 2));
+    let bottom_anchor = selection
+        .bottom()
+        .clamp(top_limit.saturating_add(1), desktop_bounds.bottom());
+    let maximum_height = u32::try_from(bottom_anchor.saturating_sub(top_limit))
+        .context("scroll preview maximum height exceeds u32")?
+        .max(1);
+    let height = scaled_preview_height(
+        preview_width as u32,
+        initial.width(),
+        initial.height(),
+        maximum_height,
+    );
+    let top = bottom_anchor.saturating_sub_unsigned(height);
+    Ok(RightPreviewGeometry {
+        bounds: RectI::new(left, top, preview_width as u32, height),
+        bottom_anchor,
+        maximum_height,
+    })
+}
+
+fn scaled_preview_height(
+    viewport_width: u32,
+    document_width: u32,
+    document_height: u32,
+    maximum_height: u32,
+) -> u32 {
+    let width = u64::from(document_width.max(1));
+    let numerator = u64::from(document_height.max(1)) * u64::from(viewport_width.max(1));
+    let scaled = numerator.div_ceil(width).min(u64::from(u32::MAX)) as u32;
+    scaled.clamp(1, maximum_height.max(1))
+}
+
+fn open_right(initial: &RgbaFrame, geometry: RightPreviewGeometry) -> Result<Box<RightPreview>> {
+    register_class()?;
+    let preview_bounds = geometry.bounds;
     let title = wide("Patrick Star Scroll Preview");
     let instance = unsafe { GetModuleHandleW(null()) };
     let hwnd = unsafe {
@@ -89,10 +165,10 @@ fn open_right(initial: &RgbaFrame) -> Result<Box<RightPreview>> {
             CLASS_NAME.as_ptr(),
             title.as_ptr(),
             WS_POPUP,
-            left,
-            bounds.top,
-            PREVIEW_WIDTH,
-            height,
+            preview_bounds.left,
+            preview_bounds.top,
+            preview_bounds.width() as i32,
+            preview_bounds.height() as i32,
             null_mut(),
             null_mut(),
             instance,
@@ -125,8 +201,11 @@ fn open_right(initial: &RgbaFrame) -> Result<Box<RightPreview>> {
         hwnd,
         renderer: Some(renderer),
         surface: Some(surface),
-        width: PREVIEW_WIDTH as u32,
-        height: height as u32,
+        width: preview_bounds.width(),
+        height: preview_bounds.height(),
+        left: preview_bounds.left,
+        bottom_anchor: geometry.bottom_anchor,
+        maximum_height: geometry.maximum_height,
         visible: false,
         error: None,
     });
@@ -148,9 +227,21 @@ fn open_right(initial: &RgbaFrame) -> Result<Box<RightPreview>> {
     })?;
     unsafe {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
     preview.visible = true;
-    preview.redraw_now()?;
+    if let Err(error) = preview.redraw_now() {
+        drop(preview);
+        return Err(error);
+    }
     unsafe {
         let _ = DwmFlush();
     }
@@ -186,6 +277,9 @@ struct RightPreview {
     surface: Option<wgl::Surface>,
     width: u32,
     height: u32,
+    left: i32,
+    bottom_anchor: i32,
+    maximum_height: u32,
     visible: bool,
     error: Option<anyhow::Error>,
 }
@@ -211,8 +305,39 @@ impl RightPreview {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
+        let document_size = (patch.document_width, patch.document_height);
         self.upload(patch)?;
+        self.resize_for_document(document_size.0, document_size.1)?;
         self.redraw_now()
+    }
+
+    fn resize_for_document(&mut self, document_width: u32, document_height: u32) -> Result<()> {
+        let height = scaled_preview_height(
+            self.width,
+            document_width,
+            document_height,
+            self.maximum_height,
+        );
+        if height == self.height {
+            return Ok(());
+        }
+        let top = self.bottom_anchor.saturating_sub_unsigned(height);
+        anyhow::ensure!(
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    HWND_TOPMOST,
+                    self.left,
+                    top,
+                    self.width as i32,
+                    height as i32,
+                    SWP_NOACTIVATE,
+                )
+            } != 0,
+            "resize scroll preview failed"
+        );
+        self.height = height;
+        Ok(())
     }
 
     fn upload(&mut self, patch: PreviewPatch<'_>) -> Result<()> {
@@ -308,4 +433,27 @@ unsafe extern "system" fn window_proc(
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_height_tracks_document_aspect_until_the_screen_limit() {
+        assert_eq!(scaled_preview_height(280, 560, 240, 900), 120);
+        assert_eq!(scaled_preview_height(280, 560, 960, 900), 480);
+        assert_eq!(scaled_preview_height(280, 560, 2400, 900), 900);
+    }
+
+    #[test]
+    fn growing_preview_keeps_its_bottom_edge_anchored() {
+        let desktop = DesktopFrame::new(RectI::new(0, 0, 1920, 1080), vec![0; 1920 * 1080 * 4])
+            .unwrap();
+        let initial = RgbaFrame::new(RectI::new(300, 200, 600, 400), vec![0; 600 * 400 * 4])
+            .unwrap();
+        let geometry = right_preview_geometry(&desktop, &initial).unwrap();
+        assert_eq!(geometry.bounds.bottom(), geometry.bottom_anchor);
+        assert_eq!(geometry.bounds.height(), 187);
+    }
 }

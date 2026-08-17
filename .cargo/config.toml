@@ -1,6 +1,7 @@
 [env]
-OPENCV_INCLUDE_PATHS = { value = "third_party/opencv-4.12-static/include", relative = true }
-OPENCV_LINK_PATHS = { value = "third_party/opencv-4.12-static/x64/vc17/staticlib", relative = true }
-OPENCV_LINK_LIBS = "static=opencv_features2d4120,static=opencv_imgproc4120,static=opencv_core4120,static=zlib"
+OPENCV_INCLUDE_PATHS = { value = "third_party/opencv-4.5.5-static/include", relative = true }
+OPENCV_LINK_PATHS = { value = "third_party/opencv-4.5.5-static/x64/vc17/staticlib", relative = true }
+OPENCV_LINK_LIBS = "static=opencv_features2d455,static=opencv_imgproc455,static=opencv_core455,static=zlib"
 OPENCV_DISABLE_PROBES = "pkg_config,cmake,vcpkg_cmake,vcpkg"
 OPENCV_MSVC_CRT = "static"
+CLANG_PATH = "C:/Program Files/LLVM/bin/clang.exe"

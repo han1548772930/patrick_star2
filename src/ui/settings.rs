@@ -1,4 +1,4 @@
-//! Slint settings window containing only the original system-settings tab.
+//! Rust-side state and callbacks for the Slint settings window.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -6,141 +6,9 @@ use std::rc::Rc;
 use anyhow::Result;
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
 
+use super::{SettingsWindow, caption_button_value};
+use crate::platform::{WindowFrame, WindowFrameConfig, WindowFrameEvent, WindowFrameHost};
 use crate::settings::{Settings, describe_shortcut, parse_shortcut};
-
-slint::slint! {
-    import { Button, ComboBox, LineEdit } from "std-widgets.slint";
-
-    export component SettingsWindow inherits Window {
-        title: "Patrick Star 设置";
-        preferred-width: 520px;
-        preferred-height: 344px;
-        min-width: 440px;
-        min-height: 320px;
-        no-frame: true;
-        background: transparent;
-        default-font-size: 14px;
-
-        in-out property <string> capture-shortcut;
-        in-out property <string> save-directory;
-        in property <[string]> ocr-languages;
-        in-out property <int> selected-ocr-index: 0;
-        in-out property <string> error-message;
-
-        callback browse-requested;
-        callback accept-requested;
-        callback cancel-requested;
-        callback request-close;
-
-        Rectangle {
-            width: parent.width;
-            height: parent.height;
-            background: #f7f8fa;
-
-            Rectangle {
-                width: parent.width;
-                height: 36px;
-                background: #202328;
-
-                Text {
-                    x: 14px;
-                    width: parent.width - 58px;
-                    height: parent.height;
-                    text: "Patrick Star 设置";
-                    color: #f2f3f5;
-                    font-size: 13px;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                }
-
-                Rectangle {
-                    x: parent.width - 44px;
-                    width: 44px;
-                    height: parent.height;
-                    background: close-touch.has-hover ? #c42b1c : transparent;
-
-                    Image {
-                        x: 14px;
-                        y: 10px;
-                        width: 16px;
-                        height: 16px;
-                        source: @image-url("../../assets/icons/x.svg");
-                        image-fit: contain;
-                        colorize: #eef0f2;
-                    }
-                    close-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.request-close(); }
-                    }
-                }
-            }
-
-            VerticalLayout {
-                y: 36px;
-                width: parent.width;
-                height: parent.height - 36px;
-                padding: 24px;
-                spacing: 8px;
-
-                Text {
-                    text: "系统设置";
-                    color: #1d2024;
-                    font-size: 20px;
-                    font-weight: 600;
-                }
-
-                Rectangle { height: 4px; }
-
-                Text { text: "截图热键"; color: #30343a; }
-                LineEdit {
-                    text <=> root.capture-shortcut;
-                    placeholder-text: "Ctrl+Alt+S";
-                }
-
-                Text { text: "保存路径"; color: #30343a; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    LineEdit {
-                        horizontal-stretch: 1;
-                        text <=> root.save-directory;
-                    }
-                    Button {
-                        text: "浏览...";
-                        clicked => { root.browse-requested(); }
-                    }
-                }
-
-                Text { text: "OCR 语言"; color: #30343a; }
-                ComboBox {
-                    model: root.ocr-languages;
-                    current-index <=> root.selected-ocr-index;
-                }
-
-                if root.error-message != "" : Text {
-                    text: root.error-message;
-                    color: #b42318;
-                    wrap: word-wrap;
-                }
-
-                Rectangle { vertical-stretch: 1; }
-
-                HorizontalLayout {
-                    alignment: end;
-                    spacing: 8px;
-                    Button {
-                        text: "取消";
-                        clicked => { root.cancel-requested(); }
-                    }
-                    Button {
-                        text: "保存";
-                        primary: true;
-                        clicked => { root.accept-requested(); }
-                    }
-                }
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrLanguageChoice {
@@ -160,6 +28,7 @@ impl OcrLanguageChoice {
 pub struct SettingsDialog {
     window: SettingsWindow,
     language_ids: Rc<Vec<Option<String>>>,
+    _frame: Box<dyn WindowFrame>,
 }
 
 impl SettingsDialog {
@@ -213,19 +82,39 @@ impl SettingsDialog {
                 let _ = window.hide();
             }
         });
-        let weak = window.as_weak();
-        window.on_request_close(move || {
-            if let Some(window) = weak.upgrade() {
-                let _ = window.hide();
-            }
-        });
         window
             .window()
             .on_close_requested(|| CloseRequestResponse::HideWindow);
 
+        let weak = window.as_weak();
+        let frame = crate::platform::current().attach_window_frame(
+            window.window(),
+            WindowFrameConfig {
+                titlebar_height: 36.0,
+                caption_button_width: 44.0,
+                minimum_width: 440.0,
+                minimum_height: 320.0,
+                rounded_corners: true,
+                always_on_top: false,
+                client_areas: Vec::new(),
+            },
+            Box::new(move |event| match event {
+                WindowFrameEvent::CaptionHoverChanged(button) => {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_caption_hover(caption_button_value(button));
+                    }
+                }
+                WindowFrameEvent::Failed(error) => {
+                    eprintln!("settings window frame failed: {error}");
+                }
+                WindowFrameEvent::Installed | WindowFrameEvent::Detached => {}
+            }),
+        )?;
+
         Ok(Self {
             window,
             language_ids: Rc::new(language_ids),
+            _frame: frame,
         })
     }
 
