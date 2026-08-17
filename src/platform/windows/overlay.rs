@@ -1,6 +1,5 @@
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use windows_sys::Win32::Foundation::{
@@ -20,14 +19,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, IDC_ARROW,
-    IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SW_HIDE, SW_SHOWNOACTIVATE, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_NCACTIVATE, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SHOWWINDOW, WM_SIZE,
-    WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    IsWindow, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+    WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::model::{
@@ -47,6 +43,12 @@ const CLASS_NAME: &[u16] = &[
     'l' as u16, 'a' as u16, 'y' as u16, 0,
 ];
 const WM_OVERLAY_RENDER: u32 = WM_APP + 0x271;
+// NVIDIA/Windows can promote an exact-size, borderless OpenGL window to a
+// direct-scanout path. Keeping one client column just outside the desktop
+// avoids that promotion while leaving the captured desktop dimensions
+// unchanged. Extend the right edge rather than the bottom edge because an
+// OpenGL viewport is bottom-aligned and would otherwise shift the image down.
+const FULLSCREEN_ESCAPE_MARGIN: u32 = 1;
 
 pub fn run(frame: DesktopFrame, features: OverlayFeatures) -> Result<CaptureOverlayResult> {
     let previous_foreground = unsafe { GetForegroundWindow() };
@@ -68,6 +70,11 @@ pub fn run(frame: DesktopFrame, features: OverlayFeatures) -> Result<CaptureOver
     );
 
     let title = wide("Patrick Star Capture Overlay");
+    let overlay_width = frame
+        .bounds
+        .width()
+        .saturating_add(FULLSCREEN_ESCAPE_MARGIN);
+    let overlay_height = frame.bounds.height();
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -76,8 +83,8 @@ pub fn run(frame: DesktopFrame, features: OverlayFeatures) -> Result<CaptureOver
             WS_POPUP,
             frame.bounds.left,
             frame.bounds.top,
-            frame.bounds.width() as i32,
-            frame.bounds.height() as i32,
+            overlay_width as i32,
+            overlay_height as i32,
             null_mut(),
             null_mut(),
             instance,
@@ -133,8 +140,6 @@ fn run_window(
         error: None,
         pending_high_surrogate: None,
         exit_after_first_frame: std::env::var_os("PATRICK_STAR2_SMOKE_TEST").is_some(),
-        trace: OverlayTrace::from_env(),
-        pending_repaint: "window-created",
         render_requested: false,
     });
     unsafe {
@@ -144,77 +149,23 @@ fn run_window(
             (&mut *state as *mut WindowState) as isize,
         );
     }
-    state.trace_event(
-        "window-created",
-        format!(
-            "hwnd={:p} bounds={bounds:?} dpi_scale={:.3} foreground={:p}",
-            hwnd, state.dpi_scale, previous_foreground
-        ),
-    );
     state.prime_pointer_state();
     // Present a complete frame while the popup is still hidden. Showing a
     // newly-created WGL window before its first swap briefly exposes the
     // class/background surface on some compositors.
-    state.render("initial-hidden");
+    state.render();
     unsafe {
-        let flush_started = Instant::now();
-        let flush_result = DwmFlush();
-        state.trace_event(
-            "initial-hidden-dwm-flush",
-            format!(
-                "result={flush_result:#x} elapsed_us={}",
-                flush_started.elapsed().as_micros()
-            ),
-        );
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         // Consume the visible window's initial update region now. Later
         // interaction frames use WM_OVERLAY_RENDER and are not Win32 paint
         // damage; WM_PAINT remains reserved for genuine system exposure.
-        state.pending_repaint = "initial-visible-redraw";
-        let redraw_result = RedrawWindow(
+        RedrawWindow(
             hwnd,
             null(),
             null_mut(),
             RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE,
         );
-        state.trace_event(
-            "initial-visible-redraw",
-            format!("result={redraw_result} visible={}", IsWindowVisible(hwnd)),
-        );
-        let flush_started = Instant::now();
-        let flush_result = DwmFlush();
-        state.trace_event(
-            "initial-visible-dwm-flush",
-            format!(
-                "result={flush_result:#x} elapsed_us={}",
-                flush_started.elapsed().as_micros()
-            ),
-        );
-        let foreground_result = SetForegroundWindow(hwnd);
-        state.trace_event(
-            "set-foreground",
-            format!(
-                "result={foreground_result} foreground={:p}",
-                GetForegroundWindow()
-            ),
-        );
-    }
-    // SetForegroundWindow synchronously changes the popup's activation and
-    // focus state after the pre-show frame has already been composed. Commit a
-    // stable frame on the activated surface so the first pointer update is not
-    // also the first WGL swap after that DWM lifecycle transition.
-    state.prime_pointer_state();
-    state.render("post-activation");
-    unsafe {
-        let flush_started = Instant::now();
-        let flush_result = DwmFlush();
-        state.trace_event(
-            "post-activation-dwm-flush",
-            format!(
-                "result={flush_result:#x} elapsed_us={}",
-                flush_started.elapsed().as_micros()
-            ),
-        );
+        SetForegroundWindow(hwnd);
     }
 
     let loop_result = message_loop();
@@ -339,64 +290,20 @@ struct WindowState {
     error: Option<anyhow::Error>,
     pending_high_surrogate: Option<u16>,
     exit_after_first_frame: bool,
-    trace: Option<OverlayTrace>,
-    pending_repaint: &'static str,
     render_requested: bool,
 }
 
-struct OverlayTrace {
-    started: Instant,
-    sequence: u32,
-    mouse_moves: u32,
-    paints: u32,
-}
-
-impl OverlayTrace {
-    fn from_env() -> Option<Self> {
-        std::env::var_os("PATRICK_STAR2_OVERLAY_TRACE").map(|_| Self {
-            started: Instant::now(),
-            sequence: 0,
-            mouse_moves: 0,
-            paints: 0,
-        })
-    }
-
-    fn event(&mut self, name: &str, detail: String) {
-        if self.sequence >= 128 {
-            return;
-        }
-        self.sequence += 1;
-        eprintln!(
-            "[overlay-trace #{:03} +{:>8}us] {name}: {detail}",
-            self.sequence,
-            self.started.elapsed().as_micros()
-        );
-    }
-}
-
 impl WindowState {
-    fn trace_event(&mut self, name: &str, detail: String) {
-        if let Some(trace) = self.trace.as_mut() {
-            trace.event(name, detail);
-        }
-    }
-
     fn prime_pointer_state(&mut self) {
         let Some(frame) = self.frame.as_ref() else {
-            self.trace_event("prime-pointer", "frame-missing".to_owned());
             return;
         };
         let mut cursor = POINT::default();
         if unsafe { GetCursorPos(&mut cursor) } == 0 {
-            self.trace_event("prime-pointer", "GetCursorPos-failed".to_owned());
             return;
         }
         let desktop = PointI::new(cursor.x, cursor.y);
         if !frame.bounds.contains(desktop) {
-            self.trace_event(
-                "prime-pointer",
-                format!("screen={desktop:?} outside={:?}", frame.bounds),
-            );
             return;
         }
         if unsafe { ScreenToClient(self.hwnd, &mut cursor) } == 0
@@ -405,35 +312,20 @@ impl WindowState {
             || cursor.x as u32 >= self.width
             || cursor.y as u32 >= self.height
         {
-            self.trace_event(
-                "prime-pointer",
-                format!("ScreenToClient-invalid screen={desktop:?} client=({}, {})", cursor.x, cursor.y),
-            );
             return;
         }
         let point = Point::new(cursor.x as f32, cursor.y as f32);
-        let detect_started = Instant::now();
         let target = self
             .session
             .wants_target()
             .then(|| self.locator.target_at(desktop))
             .flatten();
-        let detect_us = detect_started.elapsed().as_micros();
-        let changed = self.session.pointer_move(point, target);
-        let highlight = self.session.highlight();
-        self.trace_event(
-            "prime-pointer",
-            format!(
-                "screen={desktop:?} client={point:?} target={target:?} highlight={highlight:?} changed={changed} detect_us={detect_us}"
-            ),
-        );
+        self.session.pointer_move(point, target);
         self.apply_pointer_cursor(point);
     }
 
-    fn request_render(&mut self, reason: &'static str) {
-        self.pending_repaint = reason;
+    fn request_render(&mut self) {
         if self.render_requested {
-            self.trace_event("render-coalesced", format!("reason={reason}"));
             return;
         }
         let result = unsafe { PostMessageW(self.hwnd, WM_OVERLAY_RENDER, 0, 0) };
@@ -446,7 +338,6 @@ impl WindowState {
             return;
         }
         self.render_requested = true;
-        self.trace_event("render-requested", format!("reason={reason}"));
     }
 
     fn point(&self, lparam: LPARAM) -> Point {
@@ -554,23 +445,22 @@ impl WindowState {
         character.is_some_and(|character| self.session.insert_character(character))
     }
 
-    fn render(&mut self, reason: &'static str) {
+    fn render(&mut self) {
         let Some(frame) = self.frame.as_ref() else {
             return;
         };
-        let render_started = Instant::now();
-        let was_current = self.surface.is_current();
         if let Err(error) = self.surface.ensure_current() {
             self.error = Some(error.context("activate capture overlay OpenGL context"));
             unsafe { PostQuitMessage(1) };
             return;
         }
-        let current_us = render_started.elapsed().as_micros();
         let dpi_scale = self
             .session
             .selection()
             .rect()
-            .map_or(self.dpi_scale, |selection| self.toolbar_dpi_scale(selection));
+            .map_or(self.dpi_scale, |selection| {
+                self.toolbar_dpi_scale(selection)
+            });
         self.renderer.render(
             self.width.max(1),
             self.height.max(1),
@@ -578,25 +468,9 @@ impl WindowState {
             frame,
             &self.session,
         );
-        let rendered_us = render_started.elapsed().as_micros();
-        let present_started = Instant::now();
         match self.surface.present() {
-            Ok(()) => {
-                let present_us = present_started.elapsed().as_micros();
-                let total_us = render_started.elapsed().as_micros();
-                let cursor = self.session.cursor();
-                let highlight = self.session.highlight();
-                self.trace_event(
-                    "render-complete",
-                    format!(
-                        "reason={reason} cursor={cursor:?} highlight={highlight:?} was_current={was_current} ensure_current_us={current_us} draw_us={} present_us={present_us} total_us={total_us}",
-                        rendered_us.saturating_sub(current_us)
-                    ),
-                );
-                if self.exit_after_first_frame {
-                    unsafe { PostQuitMessage(0) };
-                }
-            }
+            Ok(()) if self.exit_after_first_frame => unsafe { PostQuitMessage(0) },
+            Ok(()) => {}
             Err(error) => {
                 self.error = Some(error.context("present capture overlay"));
                 unsafe { PostQuitMessage(1) };
@@ -616,49 +490,16 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     let state = unsafe { &mut *state_ptr };
-    if let Some(name) = traced_window_message_name(message) {
-        state.trace_event(
-            name,
-            format!(
-                "wparam={wparam:#x} lparam={lparam:#x} visible={} foreground={:p}",
-                unsafe { IsWindowVisible(hwnd) },
-                unsafe { GetForegroundWindow() }
-            ),
-        );
-    }
     match message {
         WM_OVERLAY_RENDER => {
             state.render_requested = false;
-            let reason = state.pending_repaint;
-            state.pending_repaint = "unspecified";
-            state.trace_event("wm-overlay-render", format!("reason={reason}"));
-            state.render(reason);
+            state.render();
             0
         }
         WM_PAINT => {
             let mut paint: PAINTSTRUCT = unsafe { zeroed() };
             unsafe { BeginPaint(hwnd, &mut paint) };
-            let reason = state.pending_repaint;
-            state.pending_repaint = "unspecified";
-            let paint_index = state.trace.as_mut().map(|trace| {
-                trace.paints += 1;
-                trace.paints
-            });
-            if paint_index.is_some_and(|index| index <= 12) {
-                state.trace_event(
-                    "wm-paint",
-                    format!(
-                        "index={} reason={reason} erase={} rect=({}, {})-({}, {})",
-                        paint_index.unwrap_or_default(),
-                        paint.fErase,
-                        paint.rcPaint.left,
-                        paint.rcPaint.top,
-                        paint.rcPaint.right,
-                        paint.rcPaint.bottom
-                    ),
-                );
-            }
-            state.render(reason);
+            state.render();
             unsafe { EndPaint(hwnd, &paint) };
             0
         }
@@ -670,15 +511,15 @@ unsafe extern "system" fn window_proc(
                     let changed = state.session.set_hovered_action(Some(action));
                     if state.session.press_action(action) {
                         unsafe { SetCapture(hwnd) };
-                        state.request_render("left-button-down-action");
+                        state.request_render();
                     } else if changed {
-                        state.request_render("left-button-down-hover");
+                        state.request_render();
                     }
                 }
                 None => {
                     if state.session.pointer_down(point) {
                         unsafe { SetCapture(hwnd) };
-                        state.request_render("left-button-down-selection");
+                        state.request_render();
                     }
                 }
             }
@@ -688,72 +529,28 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONDBLCLK => {
             let point = state.point(lparam);
             if state.session.double_click(point) {
-                state.request_render("left-button-double-click");
+                state.request_render();
             }
             state.apply_pointer_cursor(point);
             0
         }
         WM_MOUSEMOVE => {
-            let message_point = state.point(lparam);
-            let message_screen = PointI::new(
-                state.frame.as_ref().map_or(0, |frame| frame.bounds.left)
-                    + message_point.x.floor() as i32,
-                state.frame.as_ref().map_or(0, |frame| frame.bounds.top)
-                    + message_point.y.floor() as i32,
+            let point = state.point(lparam);
+            let desktop = PointI::new(
+                state.frame.as_ref().map_or(0, |frame| frame.bounds.left) + point.x.floor() as i32,
+                state.frame.as_ref().map_or(0, |frame| frame.bounds.top) + point.y.floor() as i32,
             );
-            let mut actual_screen = POINT::default();
-            let actual_screen_valid = unsafe { GetCursorPos(&mut actual_screen) } != 0;
-            let mut actual_client = actual_screen;
-            let actual_client_valid = actual_screen_valid
-                && unsafe { ScreenToClient(hwnd, &mut actual_client) } != 0
-                && actual_client.x >= 0
-                && actual_client.y >= 0
-                && (actual_client.x as u32) < state.width
-                && (actual_client.y as u32) < state.height;
-            // WM_MOUSEMOVE can be queued while the overlay is shown and activated.
-            // Sample the live pointer so stale messages collapse onto its latest position.
-            let (point, desktop, point_source) = if actual_client_valid {
-                (
-                    Point::new(actual_client.x as f32, actual_client.y as f32),
-                    PointI::new(actual_screen.x, actual_screen.y),
-                    "cursor",
-                )
-            } else {
-                (message_point, message_screen, "message")
-            };
-            let before_cursor = state.session.cursor();
-            let before_highlight = state.session.highlight();
             let pointer_action = state.action_at(point);
             let hover_changed = state.session.set_hovered_action(pointer_action);
-            let detect_started = Instant::now();
             let target = if pointer_action.is_none() && state.session.wants_target() {
                 state.locator.target_at(desktop)
             } else {
                 None
             };
-            let detect_us = detect_started.elapsed().as_micros();
             let pointer_changed = state.session.pointer_move(point, target);
             let repaint = hover_changed || pointer_changed;
-            let after_highlight = state.session.highlight();
-            let mouse_index = state.trace.as_mut().map(|trace| {
-                trace.mouse_moves += 1;
-                trace.mouse_moves
-            });
-            if mouse_index.is_some_and(|index| index <= 8) {
-                state.trace_event(
-                    "wm-mousemove",
-                    format!(
-                        "index={} source={point_source} used_client={point:?} used_screen={desktop:?} message_client={message_point:?} message_screen={message_screen:?} actual_screen=({}, {}) actual_valid={actual_screen_valid} actual_client=({}, {}) actual_client_valid={actual_client_valid} before_cursor={before_cursor:?} before_highlight={before_highlight:?} action={pointer_action:?} target={target:?} after_highlight={after_highlight:?} hover_changed={hover_changed} pointer_changed={pointer_changed} repaint={repaint} detect_us={detect_us}",
-                        mouse_index.unwrap_or_default(),
-                        actual_screen.x,
-                        actual_screen.y,
-                        actual_client.x,
-                        actual_client.y,
-                    ),
-                );
-            }
             if repaint {
-                state.request_render("mouse-move");
+                state.request_render();
             }
             state.apply_pointer_cursor(point);
             0
@@ -769,12 +566,12 @@ unsafe extern "system" fn window_proc(
                 if let Some(action) = action {
                     state.activate_action(action);
                 }
-                state.request_render("left-button-up-action");
+                state.request_render();
             } else {
                 let changed = state.session.pointer_up(point);
                 let hover_changed = state.session.set_hovered_action(pointer_action);
                 if changed || hover_changed {
-                    state.request_render("left-button-up-selection");
+                    state.request_render();
                 }
             }
             state.apply_pointer_cursor(point);
@@ -794,23 +591,34 @@ unsafe extern "system" fn window_proc(
         }
         WM_CHAR => {
             if state.insert_utf16(wparam as u16) {
-                state.request_render("text-input");
+                state.request_render();
             }
             0
         }
         WM_SIZE => {
-            let width = (lparam as u32 & 0xffff).max(1);
-            let height = ((lparam as u32 >> 16) & 0xffff).max(1);
+            let reported_width = (lparam as u32 & 0xffff).max(1);
+            let reported_height = ((lparam as u32 >> 16) & 0xffff).max(1);
+            // The compositor workaround adds one physical column to the native
+            // window, but that column is outside the captured desktop and must
+            // not become part of the logical canvas or pointer hit testing.
+            let (max_width, max_height) = state
+                .frame
+                .as_ref()
+                .map_or((reported_width, reported_height), |frame| {
+                    (frame.bounds.width(), frame.bounds.height())
+                });
+            let width = reported_width.min(max_width).max(1);
+            let height = reported_height.min(max_height).max(1);
             state.width = width;
             state.height = height;
             state.session.resize(width, height);
-            state.request_render("window-size");
+            state.request_render();
             0
         }
         WM_DPICHANGED => {
             let dpi = (wparam as u32 & 0xffff).max(96);
             state.dpi_scale = dpi as f32 / 96.0;
-            state.request_render("window-dpi");
+            state.request_render();
             0
         }
         WM_DESTROY => {
@@ -818,21 +626,6 @@ unsafe extern "system" fn window_proc(
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
-    }
-}
-
-fn traced_window_message_name(message: u32) -> Option<&'static str> {
-    match message {
-        WM_ACTIVATE => Some("wm-activate"),
-        WM_ACTIVATEAPP => Some("wm-activateapp"),
-        WM_SETFOCUS => Some("wm-setfocus"),
-        WM_KILLFOCUS => Some("wm-killfocus"),
-        WM_SHOWWINDOW => Some("wm-showwindow"),
-        WM_MOUSEACTIVATE => Some("wm-mouseactivate"),
-        WM_NCACTIVATE => Some("wm-ncactivate"),
-        WM_WINDOWPOSCHANGING => Some("wm-windowposchanging"),
-        WM_WINDOWPOSCHANGED => Some("wm-windowposchanged"),
-        _ => None,
     }
 }
 
@@ -845,46 +638,46 @@ fn handle_key(state: &mut WindowState, key: u16) {
     match key {
         VK_ESCAPE => {
             if state.session.editor_key(EditorKey::Escape) {
-                state.request_render("key-escape-editor");
+                state.request_render();
             } else {
                 unsafe { PostQuitMessage(0) };
             }
         }
         VK_RETURN => {
             if state.session.editor_key(EditorKey::Enter) {
-                state.request_render("key-enter-editor");
+                state.request_render();
             } else {
                 state.finish(CaptureIntent::Clipboard);
             }
         }
         0x5a if key_down(VK_CONTROL) => {
             if state.session.editor_key(EditorKey::Undo) {
-                state.request_render("key-undo");
+                state.request_render();
             }
         }
         0x59 if key_down(VK_CONTROL) => {
             if state.session.editor_key(EditorKey::Redo) {
-                state.request_render("key-redo");
+                state.request_render();
             }
         }
         0x41 if key_down(VK_CONTROL) && !state.session.selection_locked() => {
             state.session.select_all();
-            state.request_render("key-select-all");
+            state.request_render();
         }
         0x08 => {
             if state.session.editor_key(EditorKey::Backspace) {
-                state.request_render("key-backspace-editor");
+                state.request_render();
             } else if !state.session.selection_locked() {
                 state.session.clear();
-                state.request_render("key-backspace-clear");
+                state.request_render();
             }
         }
         0x2e => {
             if state.session.editor_key(EditorKey::Delete) {
-                state.request_render("key-delete-editor");
+                state.request_render();
             } else if !state.session.selection_locked() {
                 state.session.clear();
-                state.request_render("key-delete-clear");
+                state.request_render();
             }
         }
         VK_HOME | VK_END => {
@@ -894,7 +687,7 @@ fn handle_key(state: &mut WindowState, key: u16) {
                 EditorKey::End
             };
             if state.session.editor_key(editor_key) {
-                state.request_render("key-home-end");
+                state.request_render();
             }
         }
         VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN => {
@@ -906,7 +699,7 @@ fn handle_key(state: &mut WindowState, key: u16) {
                 _ => unreachable!(),
             };
             if state.session.editor_key(editor_key) {
-                state.request_render("key-arrow-editor");
+                state.request_render();
                 return;
             }
             let distance = if key_down(VK_SHIFT) { 10.0 } else { 1.0 };
@@ -918,7 +711,7 @@ fn handle_key(state: &mut WindowState, key: u16) {
                 _ => unreachable!(),
             };
             if state.session.nudge_selection(dx, dy) {
-                state.request_render("key-nudge-selection");
+                state.request_render();
             }
         }
         _ => {}
