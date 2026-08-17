@@ -394,7 +394,7 @@ impl DocumentPass {
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
                 glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
+                glow::LINEAR_MIPMAP_LINEAR as i32,
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -426,6 +426,10 @@ impl DocumentPass {
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(Some(pixels)),
             );
+            // The frozen desktop never changes, so build its averaging pyramid
+            // once. Mosaic rendering then gets stable block colors without
+            // repeatedly sampling every source pixel in each output fragment.
+            gl.generate_mipmap(glow::TEXTURE_2D);
             gl.use_program(Some(program));
             gl.uniform_1_i32(gl.get_uniform_location(program, "desktop").as_ref(), 0);
             gl.use_program(None);
@@ -811,8 +815,9 @@ in vec2 desktop_position;
 out vec4 color;
 void main() {
     vec2 block_center = (floor(desktop_position / block_size) + 0.5) * block_size;
-    ivec2 sample_pixel = ivec2(clamp(floor(block_center), vec2(0.0), desktop_size - 1.0));
-    color = vec4(texelFetch(desktop, sample_pixel, 0).rgb, 1.0);
+    block_center = clamp(block_center, vec2(0.5), desktop_size - vec2(0.5));
+    float average_lod = max(log2(block_size), 0.0);
+    color = vec4(textureLod(desktop, block_center / desktop_size, average_lod).rgb, 1.0);
 }
 "#;
 
@@ -842,7 +847,11 @@ fn build_mosaic_mesh(editor: &Editor, include_draft: bool) -> MosaicMesh {
             });
             pending.last_mut().expect("batch was just inserted")
         };
-        append_mosaic_mesh(&mut batch.vertices, points, *block_size as f32 * 0.5);
+        append_mosaic_mesh(
+            &mut batch.vertices,
+            points,
+            mosaic_brush_radius(*block_size),
+        );
     };
 
     for annotation in editor.annotations().items() {
@@ -959,6 +968,12 @@ fn append_mosaic_mesh(vertices: &mut Vec<f32>, points: &[crate::model::Point], r
         push_triangle(vertices, a, b, c);
         push_triangle(vertices, c, b, d);
     }
+}
+
+fn mosaic_brush_radius(block_size: u32) -> f32 {
+    // A one-block-wide stroke is difficult to paint with and leaves gaps around
+    // sensitive content. Three blocks give every strength a practical brush.
+    block_size as f32 * 1.5
 }
 
 fn push_triangle(
@@ -1275,7 +1290,11 @@ pub(super) fn paint_annotations(
         && let Some(cursor) = cursor
     {
         let mut preview = Path::new();
-        preview.circle(cursor.x, cursor.y, editor.mosaic_block_size() as f32 * 0.5);
+        preview.circle(
+            cursor.x,
+            cursor.y,
+            mosaic_brush_radius(editor.mosaic_block_size()),
+        );
         canvas.fill_path(&preview, &Paint::color(Color::rgba(96, 96, 96, 100)));
         canvas.stroke_path(
             &preview,
@@ -1881,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn mosaic_brush_radius_is_half_of_the_selected_block_size() {
+    fn mosaic_brush_spans_three_blocks() {
         let mut editor = Editor::new();
         assert!(editor.set_mosaic_block_size(10));
         editor.set_tool(Tool::Mosaic);
@@ -1897,8 +1916,8 @@ mod tests {
             .iter()
             .map(|point| point[0])
             .fold(f32::NEG_INFINITY, f32::max);
-        assert!((left - 45.0).abs() < 0.001);
-        assert!((right - 55.0).abs() < 0.001);
+        assert!((left - 35.0).abs() < 0.001);
+        assert!((right - 65.0).abs() < 0.001);
     }
 
     #[test]
