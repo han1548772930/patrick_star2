@@ -199,6 +199,23 @@ fn run_window(
             ),
         );
     }
+    // SetForegroundWindow synchronously changes the popup's activation and
+    // focus state after the pre-show frame has already been composed. Commit a
+    // stable frame on the activated surface so the first pointer update is not
+    // also the first WGL swap after that DWM lifecycle transition.
+    state.prime_pointer_state();
+    state.render("post-activation");
+    unsafe {
+        let flush_started = Instant::now();
+        let flush_result = DwmFlush();
+        state.trace_event(
+            "post-activation-dwm-flush",
+            format!(
+                "result={flush_result:#x} elapsed_us={}",
+                flush_started.elapsed().as_micros()
+            ),
+        );
+    }
 
     let loop_result = message_loop();
     let outcome = std::mem::replace(&mut state.outcome, CaptureOutcome::Cancelled);
@@ -677,19 +694,39 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_MOUSEMOVE => {
-            let point = state.point(lparam);
+            let message_point = state.point(lparam);
+            let message_screen = PointI::new(
+                state.frame.as_ref().map_or(0, |frame| frame.bounds.left)
+                    + message_point.x.floor() as i32,
+                state.frame.as_ref().map_or(0, |frame| frame.bounds.top)
+                    + message_point.y.floor() as i32,
+            );
+            let mut actual_screen = POINT::default();
+            let actual_screen_valid = unsafe { GetCursorPos(&mut actual_screen) } != 0;
+            let mut actual_client = actual_screen;
+            let actual_client_valid = actual_screen_valid
+                && unsafe { ScreenToClient(hwnd, &mut actual_client) } != 0
+                && actual_client.x >= 0
+                && actual_client.y >= 0
+                && (actual_client.x as u32) < state.width
+                && (actual_client.y as u32) < state.height;
+            // WM_MOUSEMOVE can be queued while the overlay is shown and activated.
+            // Sample the live pointer so stale messages collapse onto its latest position.
+            let (point, desktop, point_source) = if actual_client_valid {
+                (
+                    Point::new(actual_client.x as f32, actual_client.y as f32),
+                    PointI::new(actual_screen.x, actual_screen.y),
+                    "cursor",
+                )
+            } else {
+                (message_point, message_screen, "message")
+            };
             let before_cursor = state.session.cursor();
             let before_highlight = state.session.highlight();
             let pointer_action = state.action_at(point);
             let hover_changed = state.session.set_hovered_action(pointer_action);
             let detect_started = Instant::now();
             let target = if pointer_action.is_none() && state.session.wants_target() {
-                let desktop = PointI::new(
-                    state.frame.as_ref().map_or(0, |frame| frame.bounds.left)
-                        + point.x.floor() as i32,
-                    state.frame.as_ref().map_or(0, |frame| frame.bounds.top)
-                        + point.y.floor() as i32,
-                );
                 state.locator.target_at(desktop)
             } else {
                 None
@@ -703,21 +740,15 @@ unsafe extern "system" fn window_proc(
                 trace.mouse_moves
             });
             if mouse_index.is_some_and(|index| index <= 8) {
-                let mut actual_screen = POINT::default();
-                let actual_screen_valid = unsafe { GetCursorPos(&mut actual_screen) } != 0;
-                let message_screen = PointI::new(
-                    state.frame.as_ref().map_or(0, |frame| frame.bounds.left)
-                        + point.x.floor() as i32,
-                    state.frame.as_ref().map_or(0, |frame| frame.bounds.top)
-                        + point.y.floor() as i32,
-                );
                 state.trace_event(
                     "wm-mousemove",
                     format!(
-                        "index={} client={point:?} message_screen={message_screen:?} actual_screen=({}, {}) actual_valid={actual_screen_valid} before_cursor={before_cursor:?} before_highlight={before_highlight:?} action={pointer_action:?} target={target:?} after_highlight={after_highlight:?} hover_changed={hover_changed} pointer_changed={pointer_changed} repaint={repaint} detect_us={detect_us}",
+                        "index={} source={point_source} used_client={point:?} used_screen={desktop:?} message_client={message_point:?} message_screen={message_screen:?} actual_screen=({}, {}) actual_valid={actual_screen_valid} actual_client=({}, {}) actual_client_valid={actual_client_valid} before_cursor={before_cursor:?} before_highlight={before_highlight:?} action={pointer_action:?} target={target:?} after_highlight={after_highlight:?} hover_changed={hover_changed} pointer_changed={pointer_changed} repaint={repaint} detect_us={detect_us}",
                         mouse_index.unwrap_or_default(),
                         actual_screen.x,
-                        actual_screen.y
+                        actual_screen.y,
+                        actual_client.x,
+                        actual_client.y,
                     ),
                 );
             }
